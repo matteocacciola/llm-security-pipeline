@@ -1,0 +1,97 @@
+{
+  "_comment": "Default detection patterns for output_guard.py. This file can be pointed to directly, or extended/overridden by passing an additional custom config file path to PatternRegistry.load(). Entries in a custom file with the same 'name' override the corresponding default entry; new names are added alongside the defaults. Supported flags: IGNORECASE, MULTILINE, DOTALL.",
+
+  "secret_patterns": [
+    {
+      "name": "openai_api_key",
+      "pattern": "\\bsk-[A-Za-z0-9]{20,}\\b",
+      "flags": []
+    },
+    {
+      "name": "anthropic_api_key",
+      "pattern": "\\bsk-ant-[A-Za-z0-9\\-_]{20,}\\b",
+      "flags": []
+    },
+    {
+      "name": "aws_access_key",
+      "pattern": "\\bAKIA[0-9A-Z]{16}\\b",
+      "flags": []
+    },
+    {
+      "name": "generic_bearer_token",
+      "pattern": "\\bBearer\\s+[A-Za-z0-9\\-_.=]{20,}\\b",
+      "flags": ["IGNORECASE"]
+    },
+    {
+      "name": "private_key_block",
+      "pattern": "-----BEGIN (RSA |EC )?PRIVATE KEY-----",
+      "flags": []
+    },
+    {
+      "name": "generic_high_entropy_secret",
+      "pattern": "\\b(?=[A-Za-z0-9+/=]{32,}\\b)(?=.*[A-Z])(?=.*[0-9])[A-Za-z0-9+/=]{32,}\\b",
+      "flags": []
+    }
+  ],
+
+  "pii_patterns": [
+    {
+      "name": "email",
+      "pattern": "\\b[\\w.+-]+@[\\w-]+\\.[a-zA-Z]{2,}\\b",
+      "flags": []
+    },
+    {
+      "name": "it_codice_fiscale",
+      "pattern": "\\b[A-Z]{6}\\d{2}[A-EHLMPR-T]\\d{2}[A-Z]\\d{3}[A-Z]\\b",
+      "flags": []
+    }
+  ],
+
+  "injection_patterns": [
+    {"name": "it_ignora_istruzioni_precedenti", "lang": "it", "pattern": "ignora\\s+(le\\s+)?istruzion[ie]\\s+preceden[ti]", "flags": ["IGNORECASE"]},
+    {"name": "it_dimentica_istruzioni", "lang": "it", "pattern": "dimentica\\s+(tutte\\s+)?le\\s+istruzioni", "flags": ["IGNORECASE"]},
+    {"name": "it_sei_ora", "lang": "it", "pattern": "sei\\s+ora\\s+(un|una)\\b", "flags": ["IGNORECASE"]},
+    {"name": "it_modalita_sviluppatore", "lang": "it", "pattern": "modalit[aà]\\s+sviluppator[e]", "flags": ["IGNORECASE"]},
+    {"name": "it_non_hai_restrizioni", "lang": "it", "pattern": "non\\s+hai\\s+(nessuna\\s+)?restrizion[ei]", "flags": ["IGNORECASE"]},
+    {"name": "it_rivela_prompt_sistema", "lang": "it", "pattern": "rivela\\s+(il\\s+)?(tuo\\s+)?prompt\\s+di\\s+sistema", "flags": ["IGNORECASE"]},
+    {"name": "it_mostrami_istruzioni_sistema", "lang": "it", "pattern": "mostrami\\s+le\\s+istruzioni\\s+di\\s+sistema", "flags": ["IGNORECASE"]},
+    {"name": "it_agisci_senza_regole", "lang": "it", "pattern": "agisci\\s+come\\s+se\\s+non\\s+avessi\\s+regole", "flags": ["IGNORECASE"]},
+
+    {"name": "en_ignore_previous_instructions", "lang": "en", "pattern": "ignore\\s+(all\\s+)?(previous|prior|above)\\s+instructions", "flags": ["IGNORECASE"]},
+    {"name": "en_disregard_prompt", "lang": "en", "pattern": "disregard\\s+(the\\s+)?(system\\s+)?prompt", "flags": ["IGNORECASE"]},
+    {"name": "en_you_are_now", "lang": "en", "pattern": "you\\s+are\\s+now\\s+(a|an)\\b", "flags": ["IGNORECASE"]},
+    {"name": "en_developer_mode", "lang": "en", "pattern": "developer\\s+mode", "flags": ["IGNORECASE"]},
+    {"name": "en_do_anything_now", "lang": "en", "pattern": "do\\s+anything\\s+now", "flags": ["IGNORECASE"]},
+    {"name": "en_dan", "lang": "en", "pattern": "\\bDAN\\b", "flags": ["IGNORECASE"]},
+    {"name": "en_reveal_system_prompt", "lang": "en", "pattern": "reveal\\s+(your\\s+)?system\\s+prompt", "flags": ["IGNORECASE"]},
+    {"name": "en_pretend_no_restrictions", "lang": "en", "pattern": "pretend\\s+you\\s+have\\s+no\\s+restrictions", "flags": ["IGNORECASE"]},
+    {"name": "en_act_no_rules", "lang": "en", "pattern": "act\\s+as\\s+if\\s+you\\s+have\\s+no\\s+rules", "flags": ["IGNORECASE"]},
+
+    {"name": "es_ignora_instrucciones_anteriores", "lang": "es", "pattern": "ignora\\s+(las\\s+)?instrucciones\\s+anteriores", "flags": ["IGNORECASE"]},
+    {"name": "es_olvida_instrucciones", "lang": "es", "pattern": "olvida\\s+(todas\\s+)?las\\s+instrucciones", "flags": ["IGNORECASE"]},
+    {"name": "es_ahora_eres", "lang": "es", "pattern": "ahora\\s+eres\\s+(un|una)\\b", "flags": ["IGNORECASE"]},
+    {"name": "es_modo_desarrollador", "lang": "es", "pattern": "modo\\s+desarrollador", "flags": ["IGNORECASE"]},
+    {"name": "es_revela_sistema", "lang": "es", "pattern": "revela\\s+(tu\\s+)?(mensaje\\s+de\\s+)?sistema", "flags": ["IGNORECASE"]},
+    {"name": "es_finge_sin_restricciones", "lang": "es", "pattern": "finge\\s+que\\s+no\\s+tienes\\s+restricciones", "flags": ["IGNORECASE"]},
+
+    {"name": "fr_ignore_instructions_precedentes", "lang": "fr", "pattern": "ignore[rz]?\\s+les\\s+instructions\\s+pr[eé]c[eé]dentes", "flags": ["IGNORECASE"]},
+    {"name": "fr_oublie_instructions", "lang": "fr", "pattern": "oublie\\s+(toutes\\s+)?les\\s+instructions", "flags": ["IGNORECASE"]},
+    {"name": "fr_tu_es_maintenant", "lang": "fr", "pattern": "tu\\s+es\\s+maintenant\\s+(un|une)\\b", "flags": ["IGNORECASE"]},
+    {"name": "fr_mode_developpeur", "lang": "fr", "pattern": "mode\\s+d[ée]veloppeur", "flags": ["IGNORECASE"]},
+    {"name": "fr_revele_prompt_systeme", "lang": "fr", "pattern": "r[ée]v[eè]le\\s+(ton\\s+)?prompt\\s+syst[eè]me", "flags": ["IGNORECASE"]},
+    {"name": "fr_fais_comme_si_sans_restriction", "lang": "fr", "pattern": "fais\\s+comme\\s+si\\s+tu\\s+n[' ]avais\\s+aucune\\s+restriction", "flags": ["IGNORECASE"]},
+
+    {"name": "de_ignoriere_anweisungen", "lang": "de", "pattern": "ignoriere\\s+(alle\\s+)?vorherigen\\s+anweisungen", "flags": ["IGNORECASE"]},
+    {"name": "de_vergiss_anweisungen", "lang": "de", "pattern": "vergiss\\s+(alle\\s+)?anweisungen", "flags": ["IGNORECASE"]},
+    {"name": "de_du_bist_jetzt", "lang": "de", "pattern": "du\\s+bist\\s+jetzt\\s+(ein|eine)\\b", "flags": ["IGNORECASE"]},
+    {"name": "de_entwicklermodus", "lang": "de", "pattern": "entwicklermodus", "flags": ["IGNORECASE"]},
+    {"name": "de_zeige_system_prompt", "lang": "de", "pattern": "zeige\\s+(deinen\\s+)?system\\s*prompt", "flags": ["IGNORECASE"]},
+    {"name": "de_tu_so_als_ob_keine_einschraenkungen", "lang": "de", "pattern": "tu\\s+so\\s+als\\s+h[aä]ttest\\s+du\\s+keine\\s+einschr[aä]nkungen", "flags": ["IGNORECASE"]},
+
+    {"name": "pt_ignore_instrucoes_anteriores", "lang": "pt", "pattern": "ignore\\s+(as\\s+)?instru[cç][oõ]es\\s+anteriores", "flags": ["IGNORECASE"]},
+    {"name": "pt_esqueca_instrucoes", "lang": "pt", "pattern": "esque[cç]a\\s+(todas\\s+)?as\\s+instru[cç][oõ]es", "flags": ["IGNORECASE"]},
+    {"name": "pt_agora_voce_e", "lang": "pt", "pattern": "agora\\s+voc[eê]\\s+[eé]\\s+(um|uma)\\b", "flags": ["IGNORECASE"]},
+    {"name": "pt_modo_desenvolvedor", "lang": "pt", "pattern": "modo\\s+desenvolvedor", "flags": ["IGNORECASE"]},
+    {"name": "pt_revele_prompt_sistema", "lang": "pt", "pattern": "revele\\s+(seu\\s+)?prompt\\s+de\\s+sistema", "flags": ["IGNORECASE"]}
+  ]
+}
