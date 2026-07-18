@@ -1,0 +1,39 @@
+name: LLM Security Pipeline
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+
+jobs:
+  test:
+    name: "Run Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false # Runs before any images are pulled (redis/postgres/mysql for test-backends), so this is a no-op either way; kept false to be explicit.
+      - name: Clean Docker system before build
+        run: |
+          docker system prune -f
+      - name: Build and test
+        run: |
+          make test-backends
+      - name: Cleanup after tests
+        if: always()
+        run: |
+          docker system prune -af

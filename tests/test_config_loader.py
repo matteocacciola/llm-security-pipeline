@@ -72,6 +72,28 @@ def test_custom_only_config_ignores_bundled_defaults(tmp_path):
     assert registry.injection_patterns == {}
 
 
+def test_pattern_entry_rejects_unknown_field(tmp_path):
+    custom_path = _write_json(tmp_path / "custom.json", {
+        "secret_patterns": [{"name": "x", "pattern": "x", "flags": [], "unexpected_field": 1}],
+        "pii_patterns": [],
+        "injection_patterns": [],
+    })
+
+    with pytest.raises(PatternConfigError, match="unexpected_field"):
+        PatternRegistry.load(custom_config_path=custom_path)
+
+
+def test_pattern_entry_rejects_empty_name(tmp_path):
+    custom_path = _write_json(tmp_path / "custom.json", {
+        "secret_patterns": [{"name": "", "pattern": "x", "flags": []}],
+        "pii_patterns": [],
+        "injection_patterns": [],
+    })
+
+    with pytest.raises(PatternConfigError, match=r"secret_patterns\.0\.name"):
+        PatternRegistry.load(custom_config_path=custom_path)
+
+
 def test_malformed_json_raises_pattern_config_error(tmp_path):
     bad_path = tmp_path / "bad.json"
     bad_path.write_text("{not valid json", encoding="utf-8")
@@ -92,7 +114,7 @@ def test_pattern_entry_missing_name_raises(tmp_path):
         "injection_patterns": [],
     })
 
-    with pytest.raises(PatternConfigError, match="missing 'name' or 'pattern'"):
+    with pytest.raises(PatternConfigError, match=r"secret_patterns\.0\.name"):
         PatternRegistry.load(custom_config_path=custom_path)
 
 
@@ -103,7 +125,7 @@ def test_injection_entry_missing_lang_raises(tmp_path):
         "injection_patterns": [{"name": "no_lang", "pattern": "x"}],
     })
 
-    with pytest.raises(PatternConfigError, match="missing 'name', 'lang' or 'pattern'"):
+    with pytest.raises(PatternConfigError, match=r"injection_patterns\.0\.lang"):
         PatternRegistry.load(custom_config_path=custom_path)
 
 

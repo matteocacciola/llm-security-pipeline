@@ -10,8 +10,10 @@ async and Redis-backed, built for multi-process/multi-pod cloud deployments.
 - `services/sanitizer.py` – Unicode normalization, encoded-payload
   detection, explicit data-wrapping, multilingual lexical heuristics
   (IT/EN/ES/FR/DE/PT). Pure CPU, no I/O — safe to run in a worker process.
-  Injection phrases come from `config_loader.py` / `config/patterns.json`,
-  same mechanism as the secret/PII patterns below.
+  `Sanitizer` holds a compiled `PatternRegistry` (same
+  `pattern_config_path`/`include_default_patterns`/`registry` constructor
+  shape as `OutputGuard` below); `scan_text` is a convenience wrapper over
+  a lazily-created default instance.
 - `services/scope_guard.py` – signed capability tokens (HMAC-SHA256) with
   scope, TTL and anti-replay for gating agent tool calls. Async; delegates
   replay tracking to a pluggable `NonceStore`.
@@ -194,10 +196,12 @@ Tests live in `tests/` and run with pytest (`asyncio_mode = "auto"`, see
   loading, override-by-name and add-alongside semantics, and every
   `PatternConfigError` path (malformed JSON, missing file, missing
   fields, unknown flag, invalid regex, zero patterns).
-- `test_sanitizer.py` – plain unit tests for `scan_text`: multilingual
-  phrase matching (by config-defined name, not raw regex text), the
-  code-mixing score bonus, encoded-payload detection, and the block
-  threshold.
+- `test_sanitizer.py` – plain unit tests for `scan_text`/`Sanitizer`:
+  multilingual phrase matching (by config-defined name, not raw regex
+  text), the code-mixing score bonus, encoded-payload detection, the
+  block threshold, and `Sanitizer`'s override knobs (custom
+  `pattern_config_path`, `include_default_patterns=False`, an explicit
+  `registry`).
 - `test_token_replay.py` – 5 real OS processes race to redeem the same
   `max_uses=1` capability token; asserts exactly 1 succeeds. Parametrized
   over all three backends (`redis`, `postgres`, `mysql`) — each is
@@ -294,13 +298,26 @@ field, `lang`, since that heuristic groups by language (used for the
 code-mixing signal in `scan_text`) — otherwise they're the same
 `{name, pattern, flags}` shape as `secret_patterns`/`pii_patterns`.
 
-- `OutputGuard`/`SecurityPipeline(pii_config_path=...)` picks up custom
-  secret/PII patterns.
-- `scan_text` (in `services/sanitizer.py`) always loads the **bundled
-  defaults only** for injection patterns — there's currently no equivalent
-  `custom_config_path` parameter on `scan_text` itself; extend the phrase
-  list by editing `config/patterns.json` directly, or open a `PatternRegistry`
-  call if you need per-call overrides.
+- `OutputGuard`/`SecurityPipeline(pii_config_path=..., include_default_pii_patterns=...)`
+  picks up custom secret/PII patterns.
+- `Sanitizer`/`SecurityPipeline(injection_config_path=..., include_default_injection_patterns=...)`
+  picks up custom injection phrases, the same way. `Sanitizer` mirrors
+  `OutputGuard`'s constructor exactly: `pattern_config_path`,
+  `include_default_patterns`, or a pre-built `registry` for full control.
+  The module-level `scan_text` function is a thin convenience wrapper
+  around a lazily-created default `Sanitizer()` for callers who don't need
+  any of that.
+
+Every entry is validated against a pydantic schema before it's compiled:
+required fields (`name`/`pattern`, plus `lang` for injection entries),
+unknown fields rejected (`extra="forbid"`), unknown flag names, and
+regex syntax — all reported as a `PatternConfigError` pointing at the
+exact entry (e.g. `secret_patterns.2.pattern`) rather than surfacing as a
+confusing error somewhere in the scanning path, or a pattern silently not
+applying at all. `pydantic` is consequently a **required** dependency of
+this library (not an extra like `redis`/`postgres`/`mysql`): pattern
+loading always runs, for every install, regardless of which shared-state
+backend you pick.
 
 See the module docstring in `config_loader.py` for the exact schema.
 

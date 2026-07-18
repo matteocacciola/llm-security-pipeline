@@ -23,6 +23,13 @@ heuristic is grouped by language so callers can tell which languages a
 piece of text tripped, e.g. for a code-mixing signal) but are otherwise
 the same shape as secret/PII entries.
 
+Every entry is validated against a pydantic schema (required fields,
+known flag names, syntactically valid regex) before it ever reaches the
+sanitizer/output guard, so a malformed config fails loudly and precisely
+at load time — with a field-level error pointing at exactly which entry
+is wrong — rather than as a confusing error deep in the scanning path, or
+worse, a silently-skipped pattern.
+
 Usage:
     from config_loader import PatternRegistry
 
@@ -46,6 +53,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "config" / "patterns.json"
 
@@ -55,7 +63,8 @@ _FLAG_MAP = {
     "DOTALL": re.DOTALL,
 }
 
-_VALID_CATEGORIES = ("secret_patterns", "pii_patterns")
+_SECRET_CATEGORY = "secret_patterns"
+_PII_CATEGORY = "pii_patterns"
 _INJECTION_CATEGORY = "injection_patterns"
 
 
@@ -64,82 +73,88 @@ class PatternConfigError(Exception):
     an invalid regular expression."""
 
 
-def _resolve_flags(entry: dict, name: str, category_label: str) -> int:
-    flags = 0
-    for flag_name in entry.get("flags", []):
-        resolved = _FLAG_MAP.get(str(flag_name).upper())
-        if resolved is None:
-            raise PatternConfigError(
-                f"Unknown regex flag '{flag_name}' for pattern '{name}' in '{category_label}'. "
-                f"Supported flags: {list(_FLAG_MAP)}"
-            )
-        flags |= resolved
-    return flags
+# ---------------------------------------------------------------------------
+# Schema (pydantic): validates the raw JSON structure before anything is
+# compiled or handed to the sanitizer/output guard.
+# ---------------------------------------------------------------------------
 
+class _PatternEntry(BaseModel):
+    """Schema for one secret_patterns/pii_patterns entry."""
 
-def _compile_pattern_list(raw_list: list[dict], category_label: str) -> dict[str, re.Pattern]:
-    compiled: dict[str, re.Pattern] = {}
-    for entry in raw_list:
-        name = entry.get("name")
-        pattern = entry.get("pattern")
-        if not name or not pattern:
-            raise PatternConfigError(
-                f"Invalid pattern entry in '{category_label}' (missing 'name' or 'pattern'): {entry}"
-            )
-        flags = _resolve_flags(entry, name, category_label)
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    pattern: str = Field(min_length=1)
+    flags: list[str] = Field(default_factory=list)
+
+    @field_validator("flags")
+    @classmethod
+    def _flags_are_known(cls, value: list[str]) -> list[str]:
+        for flag_name in value:
+            if str(flag_name).upper() not in _FLAG_MAP:
+                raise ValueError(f"Unknown regex flag '{flag_name}'. Supported flags: {list(_FLAG_MAP)}")
+        return value
+
+    @field_validator("pattern")
+    @classmethod
+    def _pattern_is_valid_regex(cls, value: str) -> str:
         try:
-            compiled[name] = re.compile(pattern, flags)
+            re.compile(value)
         except re.error as exc:
-            raise PatternConfigError(
-                f"Invalid regular expression for pattern '{name}' in '{category_label}': {exc}"
-            ) from exc
-    return compiled
+            raise ValueError(f"Invalid regular expression: {exc}") from exc
+        return value
+
+    def resolved_flags(self) -> int:
+        flags = 0
+        for flag_name in self.flags:
+            flags |= _FLAG_MAP[flag_name.upper()]
+        return flags
 
 
-def _compile_injection_pattern_list(raw_list: list[dict], category_label: str) -> dict[str, tuple[str, re.Pattern]]:
-    """Same shape as _compile_pattern_list, plus the required 'lang' field.
-    Returns name -> (lang, compiled_pattern) so callers can regroup by
-    language while still merging/overriding by the same 'name' key as the
-    other two categories."""
-    compiled: dict[str, tuple[str, re.Pattern]] = {}
-    for entry in raw_list:
-        name = entry.get("name")
-        lang = entry.get("lang")
-        pattern = entry.get("pattern")
-        if not name or not lang or not pattern:
-            raise PatternConfigError(
-                f"Invalid pattern entry in '{category_label}' (missing 'name', 'lang' or 'pattern'): {entry}"
-            )
-        flags = _resolve_flags(entry, name, category_label)
-        try:
-            compiled[name] = (lang, re.compile(pattern, flags))
-        except re.error as exc:
-            raise PatternConfigError(
-                f"Invalid regular expression for pattern '{name}' in '{category_label}': {exc}"
-            ) from exc
-    return compiled
+class _InjectionPatternEntry(_PatternEntry):
+    """Same shape as _PatternEntry, plus the 'lang' field the multilingual
+    injection heuristic groups by."""
+
+    lang: str = Field(min_length=1)
+
+
+class _PatternConfigFile(BaseModel):
+    """Top-level schema for a whole patterns.json file."""
+
+    model_config = ConfigDict(extra="ignore")  # tolerate "_comment" and similar metadata keys
+
+    secret_patterns: list[_PatternEntry] = Field(default_factory=list)
+    pii_patterns: list[_PatternEntry] = Field(default_factory=list)
+    injection_patterns: list[_InjectionPatternEntry] = Field(default_factory=list)
 
 
 def load_pattern_file(path: str | Path) -> dict[str, dict]:
-    """Load and compile a single pattern config file. Raises PatternConfigError
-    on any structural or regex problem, so misconfiguration fails loudly at
-    startup rather than silently disabling detection at runtime."""
+    """Load, validate and compile a single pattern config file. Raises
+    PatternConfigError on any structural, schema or regex problem, so
+    misconfiguration fails loudly at startup rather than silently
+    disabling detection at runtime."""
     path = Path(path)
     if not path.exists():
         raise PatternConfigError(f"Pattern config file not found: {path}")
+
     try:
         with path.open("r", encoding="utf-8") as f:
             raw = json.load(f)
     except json.JSONDecodeError as exc:
         raise PatternConfigError(f"Malformed JSON in pattern config file {path}: {exc}") from exc
 
-    result: dict[str, dict] = {}
-    for category in _VALID_CATEGORIES:
-        result[category] = _compile_pattern_list(raw.get(category, []), category)
-    result[_INJECTION_CATEGORY] = _compile_injection_pattern_list(
-        raw.get(_INJECTION_CATEGORY, []), _INJECTION_CATEGORY
-    )
-    return result
+    try:
+        config = _PatternConfigFile.model_validate(raw)
+    except ValidationError as exc:
+        raise PatternConfigError(f"Invalid pattern config file {path}:\n{exc}") from exc
+
+    return {
+        _SECRET_CATEGORY: {e.name: re.compile(e.pattern, e.resolved_flags()) for e in config.secret_patterns},
+        _PII_CATEGORY: {e.name: re.compile(e.pattern, e.resolved_flags()) for e in config.pii_patterns},
+        _INJECTION_CATEGORY: {
+            e.name: (e.lang, re.compile(e.pattern, e.resolved_flags())) for e in config.injection_patterns
+        },
+    }
 
 
 @dataclass
@@ -164,16 +179,16 @@ class PatternRegistry:
 
         if include_defaults:
             defaults = load_pattern_file(DEFAULT_CONFIG_PATH)
-            secret_patterns.update(defaults["secret_patterns"])
-            pii_patterns.update(defaults["pii_patterns"])
+            secret_patterns.update(defaults[_SECRET_CATEGORY])
+            pii_patterns.update(defaults[_PII_CATEGORY])
             injection_by_name.update(defaults[_INJECTION_CATEGORY])
 
         if custom_config_path:
             custom = load_pattern_file(custom_config_path)
             # Custom entries override defaults sharing the same name, and are
             # added alongside the rest.
-            secret_patterns.update(custom["secret_patterns"])
-            pii_patterns.update(custom["pii_patterns"])
+            secret_patterns.update(custom[_SECRET_CATEGORY])
+            pii_patterns.update(custom[_PII_CATEGORY])
             injection_by_name.update(custom[_INJECTION_CATEGORY])
 
         if not secret_patterns and not pii_patterns and not injection_by_name:

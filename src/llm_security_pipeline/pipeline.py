@@ -82,7 +82,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from .services import (
-    scan_text,
+    Sanitizer,
     SanitizationResult,
     ScopeGuard,
     OutputGuard,
@@ -160,11 +160,14 @@ class SecurityPipeline:
         input_risk_threshold: float = 0.6,
         output_overlap_threshold: float = 0.35,
         scope_guard: ScopeGuard | None = None,
+        sanitizer: Sanitizer | None = None,
         output_guard: OutputGuard | None = None,
         rate_limiter: SessionRateLimiter | None = None,
         audit_logger: AuditLogger | None = None,
         pii_config_path: str | None = None,
         include_default_pii_patterns: bool = True,
+        injection_config_path: str | None = None,
+        include_default_injection_patterns: bool = True,
         session_limits: SessionLimits | None = None,
         state_backend: StateBackend | None = None,
         process_executor: ProcessPoolExecutor | None = None,
@@ -199,6 +202,11 @@ class SecurityPipeline:
                 store=state_backend.session_store if state_backend is not None else None,
             )
         self.rate_limiter = rate_limiter
+
+        self.sanitizer = sanitizer or Sanitizer(
+            pattern_config_path=injection_config_path,
+            include_default_patterns=include_default_injection_patterns,
+        )
 
         self.output_guard = output_guard or OutputGuard(
             pattern_config_path=pii_config_path,
@@ -251,13 +259,19 @@ class SecurityPipeline:
         # the regex work is large enough to be worth the IPC cost.
         if len(user_input) >= self.large_input_offload_threshold_chars:
             scan_awaitable = loop.run_in_executor(
-                self.process_executor, scan_text, user_input, self.input_risk_threshold, "USER_DATA",
+                self.process_executor,
+                self.sanitizer.scan_text,
+                user_input,
+                self.input_risk_threshold,
+                "USER_DATA",
                 session_id and f"user_message:{session_id}",
             )
         else:
             async def _inline_scan():
-                return scan_text(
-                    user_input, threshold=self.input_risk_threshold, tag="USER_DATA",
+                return self.sanitizer.scan_text(
+                    user_input,
+                    threshold=self.input_risk_threshold,
+                    tag="USER_DATA",
                     source_id=session_id and f"user_message:{session_id}",
                 )
             scan_awaitable = _inline_scan()
@@ -301,7 +315,7 @@ class SecurityPipeline:
         This is the indirect-injection surface. For scanning several
         chunks at once, prefer pre_process_external_batch, which actually
         parallelizes across CPU cores."""
-        result = scan_text(
+        result = self.sanitizer.scan_text(
             content,
             threshold=threshold if threshold is not None else self.input_risk_threshold,
             tag="EXTERNAL_CONTENT",
@@ -335,13 +349,18 @@ class SecurityPipeline:
 
         if len(chunks) < self.external_scan_parallel_min_chunks:
             results = [
-                scan_text(content, threshold=effective_threshold, tag="EXTERNAL_CONTENT", source_id=source_id)
+                self.sanitizer.scan_text(content, threshold=effective_threshold, tag="EXTERNAL_CONTENT", source_id=source_id)
                 for content, source_id in chunks
             ]
         else:
             futures = [
                 loop.run_in_executor(
-                    self.process_executor, scan_text, content, effective_threshold, "EXTERNAL_CONTENT", source_id,
+                    self.process_executor,
+                    self.sanitizer.scan_text,
+                    content,
+                    effective_threshold,
+                    "EXTERNAL_CONTENT",
+                    source_id,
                 )
                 for content, source_id in chunks
             ]

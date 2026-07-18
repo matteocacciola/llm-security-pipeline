@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Defensive pipeline for LLM apps: prompt injection, tool-call gating, output/PII guards"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "pydantic>=2.13.4",
+]
 
 [project.optional-dependencies]
 redis = ["redis>=5.0"]
@@ -28,6 +30,18 @@ markers = [
     "postgres: integration test requires a reachable PostgreSQL instance; skipped automatically otherwise",
     "mysql: integration test requires a reachable MySQL/MariaDB instance; skipped automatically otherwise",
 ]
+
+[tool.coverage.run]
+# The cross-process tests spawn real OS worker processes via
+# ProcessPoolExecutor; without this, coverage.py only sees the main pytest
+# process and reports the store methods those workers call (e.g.
+# check_and_increment/_increment) as untested even though they are. Requires
+# COVERAGE_PROCESS_START to be set in the environment running pytest (see
+# the Makefile) so each worker process auto-starts its own coverage
+# tracking, then gets combined into one report at the end.
+parallel = true
+concurrency = ["multiprocessing", "thread"]
+source = ["llm_security_pipeline"]
 
 [dependency-groups]
 dev = [

@@ -71,12 +71,11 @@ def find_encoded_payloads(text: str, min_len: int = 24) -> list[str]:
         except (binascii.Error, ValueError):
             continue
     for token in re.findall(r"(?:[0-9a-fA-F]{2}){12,}", text):
-        try:
-            decoded_text = bytes.fromhex(token).decode("utf-8", errors="ignore")
-            if decoded_text.strip():
-                findings.append(decoded_text)
-        except ValueError:
-            continue
+        # No try/except needed here: the regex only ever matches complete
+        # hex-digit pairs, so bytes.fromhex(token) cannot raise.
+        decoded_text = bytes.fromhex(token).decode("utf-8", errors="ignore")
+        if decoded_text.strip():
+            findings.append(decoded_text)
     return findings
 
 
@@ -100,27 +99,6 @@ def wrap_as_data(text: str, tag: str = "USER_DATA") -> str:
     return f"<{tag}>\n{safe_text}\n</{tag}>"
 
 
-# ---------------------------------------------------------------------------
-# 2. Multilingual lexical heuristics (supporting signal)
-# ---------------------------------------------------------------------------
-
-# Common injection/jailbreak phrases across languages (IT/EN/ES/FR/DE/PT),
-# loaded from config/patterns.json via PatternRegistry — same mechanism as
-# the secret/PII patterns in output_guard.py, so the phrase list can be
-# extended or overridden without touching this file. Lazily built and
-# cached at first use rather than at import time, and re-built once per
-# process: a ProcessPoolExecutor worker that calls scan_text starts with a
-# fresh module state, so it loads and compiles its own copy on first call.
-_default_registry: PatternRegistry | None = None
-
-
-def _get_injection_patterns() -> dict[str, dict[str, re.Pattern]]:
-    global _default_registry
-    if _default_registry is None:
-        _default_registry = PatternRegistry.load()
-    return _default_registry.injection_patterns
-
-
 @dataclass
 class SanitizationResult:
     original_text: str
@@ -134,58 +112,115 @@ class SanitizationResult:
     source_id: str | None = None  # e.g. "user_message", "web:https://...", "rag_chunk_12"
 
 
+# ---------------------------------------------------------------------------
+# 2. Multilingual lexical heuristics (supporting signal)
+# ---------------------------------------------------------------------------
+
+class Sanitizer:
+    """Stateful sanitizer holding a compiled PatternRegistry, so the
+    multilingual injection-phrase list is parsed and validated once (at
+    construction time) rather than on every scan call. Mirrors
+    OutputGuard's constructor shape in output_guard.py.
+
+    Example:
+        # Defaults only
+        sanitizer = Sanitizer()
+
+        # Defaults + your own phrases from an external file
+        sanitizer = Sanitizer(pattern_config_path="my_patterns.json")
+
+        # Only your own phrases, no bundled defaults
+        sanitizer = Sanitizer(pattern_config_path="my_patterns.json", include_default_patterns=False)
+    """
+
+    def __init__(
+        self,
+        pattern_config_path: str | None = None,
+        include_default_patterns: bool = True,
+        registry: PatternRegistry | None = None,
+    ):
+        self.registry = registry or PatternRegistry.load(
+            custom_config_path=pattern_config_path,
+            include_defaults=include_default_patterns,
+        )
+
+    def scan_text(
+        self,
+        text: str,
+        threshold: float = 0.6,
+        tag: str = "USER_DATA",
+        source_id: str | None = None,
+    ) -> SanitizationResult:
+        """Run the full sanitization pipeline on a piece of text, regardless
+        of its language or origin. Use `tag`/`source_id` to distinguish
+        direct user input from external content (web pages, RAG chunks,
+        tool outputs) when scanning for indirect prompt injection."""
+        normalized = normalize_text(text)
+        injection_patterns = self.registry.injection_patterns
+
+        matched_patterns: list[str] = []
+        matched_languages: set[str] = set()
+
+        for lang, patterns in injection_patterns.items():
+            for name, pattern in patterns.items():
+                if pattern.search(normalized):
+                    matched_patterns.append(name)
+                    matched_languages.add(lang)
+
+        decoded_hits = find_encoded_payloads(normalized)
+        # Re-run the lexical scan on decoded content too: a base64 payload
+        # that hides "ignore previous instructions" must still be caught.
+        for decoded in decoded_hits:
+            decoded_norm = normalize_text(decoded)
+            for lang, patterns in injection_patterns.items():
+                for name, pattern in patterns.items():
+                    if pattern.search(decoded_norm):
+                        matched_patterns.append(f"[decoded] {name}")
+                        matched_languages.add(lang)
+
+        # Scoring: structural signals (encoded payloads, multiple languages
+        # hit at once) weigh more than single lexical phrases, which are
+        # easily bypassed through paraphrasing.
+        score = 0.0
+        score += min(len(matched_patterns) * 0.25, 0.75)
+        if decoded_hits:
+            score += 0.4
+        if len(matched_languages) > 1:
+            score += 0.15  # suspicious code-mixing signal
+        score = min(score, 1.0)
+
+        return SanitizationResult(
+            original_text=text,
+            normalized_text=normalized,
+            wrapped_text=wrap_as_data(normalized, tag=tag),
+            risk_score=round(score, 2),
+            matched_patterns=matched_patterns,
+            matched_languages=matched_languages,
+            decoded_payload_hits=decoded_hits,
+            blocked=score >= threshold,
+            source_id=source_id,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Module-level convenience helper backed by a lazily-created default
+# sanitizer, for callers who don't need custom pattern configuration.
+# ---------------------------------------------------------------------------
+
+_default_sanitizer: Sanitizer | None = None
+
+
+def _get_default_sanitizer() -> Sanitizer:
+    global _default_sanitizer
+    if _default_sanitizer is None:
+        _default_sanitizer = Sanitizer()
+    return _default_sanitizer
+
+
 def scan_text(
     text: str,
     threshold: float = 0.6,
     tag: str = "USER_DATA",
     source_id: str | None = None,
 ) -> SanitizationResult:
-    """Run the full sanitization pipeline on a piece of text, regardless of
-    its language or origin. Use `tag`/`source_id` to distinguish direct user
-    input from external content (web pages, RAG chunks, tool outputs) when
-    scanning for indirect prompt injection."""
-    normalized = normalize_text(text)
-    injection_patterns = _get_injection_patterns()
-
-    matched_patterns: list[str] = []
-    matched_languages: set[str] = set()
-
-    for lang, patterns in injection_patterns.items():
-        for name, pattern in patterns.items():
-            if pattern.search(normalized):
-                matched_patterns.append(name)
-                matched_languages.add(lang)
-
-    decoded_hits = find_encoded_payloads(normalized)
-    # Re-run the lexical scan on decoded content too: a base64 payload that
-    # hides "ignore previous instructions" must still be caught.
-    for decoded in decoded_hits:
-        decoded_norm = normalize_text(decoded)
-        for lang, patterns in injection_patterns.items():
-            for name, pattern in patterns.items():
-                if pattern.search(decoded_norm):
-                    matched_patterns.append(f"[decoded] {name}")
-                    matched_languages.add(lang)
-
-    # Scoring: structural signals (encoded payloads, multiple languages hit
-    # at once) weigh more than single lexical phrases, which are easily
-    # bypassed through paraphrasing.
-    score = 0.0
-    score += min(len(matched_patterns) * 0.25, 0.75)
-    if decoded_hits:
-        score += 0.4
-    if len(matched_languages) > 1:
-        score += 0.15  # suspicious code-mixing signal
-    score = min(score, 1.0)
-
-    return SanitizationResult(
-        original_text=text,
-        normalized_text=normalized,
-        wrapped_text=wrap_as_data(normalized, tag=tag),
-        risk_score=round(score, 2),
-        matched_patterns=matched_patterns,
-        matched_languages=matched_languages,
-        decoded_payload_hits=decoded_hits,
-        blocked=score >= threshold,
-        source_id=source_id,
-    )
+    return _get_default_sanitizer().scan_text(text, threshold=threshold, tag=tag, source_id=source_id)

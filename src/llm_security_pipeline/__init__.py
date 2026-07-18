@@ -20,6 +20,7 @@ from .sessions import (
     RedisSessionStore,
 )
 from .services import (
+    Sanitizer,
     scan_text,
     SanitizationResult,
     normalize_text,
@@ -49,6 +50,7 @@ __all__ = [
     "StdoutAuditLogger",
     "RedisStreamAuditLogger",
     # Input sanitization
+    "Sanitizer",
     "scan_text",
     "SanitizationResult",
     "normalize_text",
