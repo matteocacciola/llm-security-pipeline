@@ -1,17 +1,66 @@
-from .sanitizer import Sanitizer, scan_text, SanitizationResult, normalize_text, wrap_as_data
+from .sanitizer import (
+    Sanitizer,
+    scan_text,
+    SanitizationResult,
+    RiskWeights,
+    DEFAULT_RISK_WEIGHTS,
+    normalize_text,
+    wrap_as_data,
+    decode_tag_characters,
+    find_hidden_text,
+)
 from .scope_guard import ScopeGuard, CapabilityToken, ScopeError
+from .exfil_guard import (
+    ExfilGuard,
+    ExfilPolicy,
+    ExfilScanResult,
+    ExfilAttemptBlocked,
+    URLFinding,
+    shannon_entropy,
+)
 from .output_guard import OutputGuard, scan_output, OutputScanResult, find_pii, find_secrets
+from .ingest_guard import (
+    IngestGuard,
+    IngestVerdict,
+    RetrievalVerdict,
+    content_hash,
+    ACCEPT,
+    QUARANTINE,
+    REJECT,
+    TRUSTED,
+    PARTNER,
+    UNTRUSTED,
+)
+from .media_guard import (
+    MediaScanner,
+    MediaScanResult,
+    ContentExtractor,
+    ExtractedText,
+    BinaryStringsExtractor,
+    ExifExtractor,
+    CallableExtractor,
+)
 from .rate_limiter import SessionRateLimiter, SessionLimits, RateLimitExceeded
 
 __all__ = [
     "Sanitizer",
     "scan_text",
     "SanitizationResult",
+    "RiskWeights",
+    "DEFAULT_RISK_WEIGHTS",
     "normalize_text",
     "wrap_as_data",
+    "decode_tag_characters",
+    "find_hidden_text",
     "ScopeGuard",
     "CapabilityToken",
     "ScopeError",
+    "ExfilGuard",
+    "ExfilPolicy",
+    "ExfilScanResult",
+    "ExfilAttemptBlocked",
+    "URLFinding",
+    "shannon_entropy",
     "OutputGuard",
     "scan_output",
     "OutputScanResult",
@@ -19,5 +68,22 @@ __all__ = [
     "find_secrets",
     "SessionRateLimiter",
     "SessionLimits",
+    "IngestGuard",
+    "IngestVerdict",
+    "RetrievalVerdict",
+    "content_hash",
+    "ACCEPT",
+    "QUARANTINE",
+    "REJECT",
+    "TRUSTED",
+    "PARTNER",
+    "UNTRUSTED",
+    "MediaScanner",
+    "MediaScanResult",
+    "ContentExtractor",
+    "ExtractedText",
+    "BinaryStringsExtractor",
+    "ExifExtractor",
+    "CallableExtractor",
     "RateLimitExceeded"
 ]

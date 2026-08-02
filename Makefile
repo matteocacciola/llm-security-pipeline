@@ -26,12 +26,19 @@ test:  ## Run tests.
 	COVERAGE_PROCESS_START=pyproject.toml uv run python -m pytest --color=yes -W ignore --disable-warnings ${args}
 
 test-backends: ## Run the full test suite, including the postgres/mysql/redis integration tests, against real throwaway Docker containers (torn down automatically on exit).
-	@trap 'docker stop llm-sec-test-redis llm-sec-test-pg llm-sec-test-mysql >/dev/null 2>&1 || true' EXIT; \
+	@trap 'docker stop llm-sec-test-redis llm-sec-test-redis-cluster llm-sec-test-pg llm-sec-test-mysql >/dev/null 2>&1 || true' EXIT; \
 	set -e; \
-	docker rm -f llm-sec-test-redis llm-sec-test-pg llm-sec-test-mysql >/dev/null 2>&1 || true; \
+	docker rm -f llm-sec-test-redis llm-sec-test-redis-cluster llm-sec-test-pg llm-sec-test-mysql >/dev/null 2>&1 || true; \
 	docker run -d --rm --name llm-sec-test-redis -p 6379:6379 redis:7-alpine >/dev/null; \
+	docker run -d --rm --name llm-sec-test-redis-cluster -p 7000:7000 redis:7-alpine \
+		redis-server --port 7000 --cluster-enabled yes --cluster-config-file nodes.conf \
+		--cluster-announce-ip 127.0.0.1 >/dev/null; \
 	docker run -d --rm --name llm-sec-test-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16-alpine >/dev/null; \
 	docker run -d --rm --name llm-sec-test-mysql -e MYSQL_ALLOW_EMPTY_PASSWORD=yes -e MYSQL_DATABASE=test -p 3306:3306 mysql:8 >/dev/null; \
+	echo "Assigning all hash slots to the single-node test cluster..."; \
+	timeout 30 sh -c 'until docker exec llm-sec-test-redis-cluster redis-cli -p 7000 ping >/dev/null 2>&1; do sleep 1; done'; \
+	docker exec llm-sec-test-redis-cluster redis-cli -p 7000 cluster addslotsrange 0 16383 >/dev/null 2>&1 || true; \
+	timeout 30 sh -c 'until docker exec llm-sec-test-redis-cluster redis-cli -p 7000 cluster info 2>/dev/null | grep -q "cluster_state:ok"; do sleep 1; done'; \
 	echo "Waiting for Postgres to accept connections..."; \
 	timeout 60 sh -c 'until docker exec llm-sec-test-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done'; \
 	echo "Waiting for MySQL to accept connections..."; \
@@ -39,6 +46,7 @@ test-backends: ## Run the full test suite, including the postgres/mysql/redis in
 	uv sync --group dev --all-extras; \
 	rm -f .coverage .coverage.*; \
 	REDIS_URL=redis://localhost:6379/0 \
+	REDIS_CLUSTER_URL=redis://127.0.0.1:7000 \
 	POSTGRES_DSN=postgresql://postgres:postgres@localhost:5432/postgres \
 	MYSQL_HOST=127.0.0.1 MYSQL_PORT=3306 MYSQL_USER=root MYSQL_PASSWORD= MYSQL_DB=test \
 	COVERAGE_PROCESS_START=pyproject.toml \

@@ -3,6 +3,12 @@ redis_stores.py
 Redis implementations of the store interfaces defined in stores.py, for
 multi-process/multi-pod deployments.
 
+Cluster model: session keys are wrapped in a Redis Cluster hash tag
+(`sentinel:session:{<session_id>}:risk`) so that every key a script or a
+reset touches for a given session resolves to the same hash slot. The
+topology is detected on first use, so the same code is correct on a
+single node and on a cluster with no configuration; see redis_keys.py.
+
 Atomicity model: every check-and-update sequence runs as a single Lua
 script. Redis executes each script atomically (single-threaded,
 run-to-completion), so "read current count, compare, increment, set TTL"
@@ -18,7 +24,8 @@ from __future__ import annotations
 
 import time
 
-from .stores import NonceStore, SessionStore
+from .redis_keys import HashTagPolicy, hash_tag, validate_key_prefix
+from .stores import NonceStore, ProvenanceRecord, ProvenanceStore, SessionStore
 
 try:
     from redis.asyncio import Redis
@@ -78,6 +85,16 @@ def _require_redis() -> None:
 
 
 class RedisNonceStore(NonceStore):
+    """Nonce keys are deliberately left untagged.
+
+    The increment script touches exactly one key, so it is already
+    cluster-safe, and untagged nonces spread evenly across slots. Adding a
+    tag purely for symmetry with the session store would rename every key
+    on upgrade, which for an anti-replay counter means previously spent
+    nonces read as unused until the old keys expire — a brief replay window
+    bought for nothing.
+    """
+
     def __init__(self, redis_client: "Redis", key_prefix: str = "sentinel:nonce:"):
         _require_redis()
         self._redis = redis_client
@@ -90,21 +107,50 @@ class RedisNonceStore(NonceStore):
         return int(result)
 
 
+# Every field the store keeps for one session, in deletion order:
+# `flagged` goes last so that an interrupted reset leaves the session
+# flagged rather than cleared, i.e. fails closed.
+_SESSION_FIELDS = ("requests", "tool_calls", "risk", "risk_last", "flagged")
+
+
 class RedisSessionStore(SessionStore):
-    def __init__(self, redis_client: "Redis", key_prefix: str = "sentinel:session:"):
+    """Session counters and cumulative risk, cluster-safe by construction.
+
+    `hash_tags` selects the key layout: "auto" (default) detects Redis
+    Cluster on first use, True always tags, False never tags and raises if
+    the client turns out to be a cluster client. See redis_keys.py.
+    """
+
+    def __init__(
+        self,
+        redis_client: "Redis",
+        key_prefix: str = "sentinel:session:",
+        hash_tags: bool | str = "auto",
+    ):
         _require_redis()
+        validate_key_prefix(key_prefix)
         self._redis = redis_client
         self._key_prefix = key_prefix
+        self._tags = HashTagPolicy(hash_tags)
         self._incr_script = self._redis.register_script(_INCR_WITH_TTL_SCRIPT)
         self._add_risk_script = self._redis.register_script(_ADD_RISK_SCRIPT)
 
+    async def _keys(self, session_id: str, *fields: str) -> list[str]:
+        """Build keys for `session_id`, all guaranteed to share a hash slot
+        when tagging is in effect."""
+        base = f"{self._key_prefix}{session_id}"
+        if await self._tags.enabled(self._redis):
+            base = f"{self._key_prefix}{{{hash_tag(session_id)}}}"
+
+        return [f"{base}:{field}" for field in fields]
+
     async def increment_requests(self, session_id: str, window_seconds: int) -> int:
-        key = f"{self._key_prefix}{session_id}:requests"
+        (key,) = await self._keys(session_id, "requests")
         result = await self._incr_script(keys=[key], args=[window_seconds])
         return int(result)
 
     async def increment_tool_calls(self, session_id: str, window_seconds: int) -> int:
-        key = f"{self._key_prefix}{session_id}:tool_calls"
+        (key,) = await self._keys(session_id, "tool_calls")
         result = await self._incr_script(keys=[key], args=[window_seconds])
         return int(result)
 
@@ -112,25 +158,56 @@ class RedisSessionStore(SessionStore):
         self, session_id: str, risk_delta: float, decay_per_second: float,
         flag_threshold: float, ttl_seconds: int,
     ) -> float:
-        risk_key = f"{self._key_prefix}{session_id}:risk"
-        last_key = f"{self._key_prefix}{session_id}:risk_last"
-        flag_key = f"{self._key_prefix}{session_id}:flagged"
+        keys = await self._keys(session_id, "risk", "risk_last", "flagged")
         result = await self._add_risk_script(
-            keys=[risk_key, last_key, flag_key],
+            keys=keys,
             args=[risk_delta, decay_per_second, time.time(), ttl_seconds, flag_threshold],
         )
         return float(result)
 
     async def is_flagged(self, session_id: str) -> bool:
-        flag_key = f"{self._key_prefix}{session_id}:flagged"
+        (flag_key,) = await self._keys(session_id, "flagged")
         return bool(await self._redis.exists(flag_key))
 
     async def reset_session(self, session_id: str) -> None:
-        keys = [
-            f"{self._key_prefix}{session_id}:requests",
-            f"{self._key_prefix}{session_id}:tool_calls",
-            f"{self._key_prefix}{session_id}:risk",
-            f"{self._key_prefix}{session_id}:risk_last",
-            f"{self._key_prefix}{session_id}:flagged",
-        ]
-        await self._redis.delete(*keys)
+        keys = await self._keys(session_id, *_SESSION_FIELDS)
+        if self._tags.resolved:
+            # One slot, so one round trip.
+            await self._redis.delete(*keys)
+            return
+        # Untagged layout: a multi-key DEL is only safe on a single node,
+        # and this branch cannot assume one. Deleting individually costs a
+        # round trip per field and gives up atomicity, which reset does not
+        # need — the field order makes a partial reset fail closed.
+        for key in keys:
+            await self._redis.delete(key)
+
+
+class RedisProvenanceStore(ProvenanceStore):
+    """Ingest verdicts as Redis hashes, one key per document.
+
+    Single-key operations throughout, so this is cluster-safe without hash
+    tags. No TTL is set: a provenance record has to outlive whatever
+    session happened to retrieve the document, and an expired record is
+    indistinguishable from a document that was never scanned.
+    """
+
+    def __init__(self, redis_client: "Redis", key_prefix: str = "sentinel:provenance:"):
+        _require_redis()
+        self._redis = redis_client
+        self._key_prefix = key_prefix
+
+    def _key(self, document_id: str) -> str:
+        return f"{self._key_prefix}{document_id}"
+
+    async def record(self, record: ProvenanceRecord) -> None:
+        await self._redis.hset(self._key(record.document_id), mapping=record.to_dict())
+
+    async def get(self, document_id: str) -> ProvenanceRecord | None:
+        data = await self._redis.hgetall(self._key(document_id))
+        if not data:
+            return None
+        return ProvenanceRecord.from_dict(data)
+
+    async def delete(self, document_id: str) -> None:
+        await self._redis.delete(self._key(document_id))

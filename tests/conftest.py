@@ -23,6 +23,12 @@ import redis.asyncio as redis_async
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
+# A cluster-enabled server, used only by the Redis Cluster key-layout tests.
+# One node owning all 16384 slots is enough: CROSSSLOT is rejected by the
+# client and the server regardless of how many nodes hold the slots, so a
+# full multi-node cluster would slow CI down without testing anything more.
+REDIS_CLUSTER_URL = os.environ.get("REDIS_CLUSTER_URL", "redis://127.0.0.1:7000")
+
 POSTGRES_DSN = os.environ.get("POSTGRES_DSN", "postgresql://postgres:postgres@localhost:5432/postgres")
 
 MYSQL_HOST = os.environ.get("MYSQL_HOST", "127.0.0.1")
@@ -42,6 +48,32 @@ def _redis_reachable() -> bool:
             return False
         finally:
             await client.aclose()
+
+    return asyncio.run(_ping())
+
+
+def _redis_cluster_reachable() -> bool:
+    async def _ping() -> bool:
+        try:
+            from redis.asyncio.cluster import RedisCluster
+        except ImportError:
+            return False
+        try:
+            client = RedisCluster.from_url(REDIS_CLUSTER_URL)
+        except Exception:
+            return False
+        try:
+            # Reachability is not enough: a node with unassigned slots
+            # accepts connections but refuses every keyed command.
+            info = await client.cluster_info()
+            return info.get("cluster_state") == "ok"
+        except Exception:
+            return False
+        finally:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
     return asyncio.run(_ping())
 
@@ -96,6 +128,7 @@ def _mysql_reachable() -> bool:
 # Each name doubles as the pytest marker used on the matching test cases.
 _BACKEND_CHECKS = {
     "redis": (_redis_reachable, REDIS_URL),
+    "redis_cluster": (_redis_cluster_reachable, REDIS_CLUSTER_URL),
     "postgres": (_postgres_reachable, POSTGRES_DSN),
     "mysql": (_mysql_reachable, f"{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"),
 }

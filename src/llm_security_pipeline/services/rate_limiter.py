@@ -47,6 +47,14 @@ class SessionLimits:
     # How long session state survives with no activity before Redis
     # expires it. Should comfortably exceed window_seconds.
     session_ttl_seconds: int = 3600
+    # Cumulative risk threshold for an ACTOR — an account, API key, tenant
+    # or source address — accumulated across all of that actor's sessions.
+    # Higher than the per-session threshold because it spans more traffic,
+    # and longer-lived because rotating sessions is the evasion it exists
+    # to catch. Session risk resets when the session id changes; this does
+    # not, which is the whole point.
+    actor_risk_threshold: float = 3.0
+    actor_ttl_seconds: int = 86400
 
 
 class SessionRateLimiter:
@@ -85,21 +93,57 @@ class SessionRateLimiter:
                 f"tool calls within {self.limits.window_seconds}s."
             )
 
-    async def record_turn_risk(self, session_id: str, risk_score: float) -> float:
+    async def record_turn_risk(
+        self, session_id: str, risk_score: float, actor_id: str | None = None,
+    ) -> float:
         """Feed the per-turn risk score (e.g. from sanitizer.scan_text) into
         the session's cumulative total. Returns the updated cumulative
         score. Flags the session once the cumulative threshold is crossed,
-        even if no single turn crossed the per-turn block threshold."""
-        return await self._store.add_risk(
+        even if no single turn crossed the per-turn block threshold.
+
+        With `actor_id`, the same score also accumulates against a second,
+        coarser key. This is what survives session rotation: `session_id`
+        is a string the caller supplies, so an attacker who sends a new one
+        every turn keeps the session total at zero forever. An actor key
+        does not have to be unforgeable to help — an account id, API key,
+        tenant or source address only has to be more expensive to change
+        than the session id is.
+        """
+        cumulative = await self._store.add_risk(
             session_id,
             risk_delta=risk_score,
             decay_per_second=self.limits.risk_decay_per_second,
             flag_threshold=self.limits.cumulative_risk_threshold,
             ttl_seconds=self.limits.session_ttl_seconds,
         )
+        if actor_id is not None:
+            await self._store.add_risk(
+                self.actor_key(actor_id),
+                risk_delta=risk_score,
+                decay_per_second=self.limits.risk_decay_per_second,
+                flag_threshold=self.limits.actor_risk_threshold,
+                ttl_seconds=self.limits.actor_ttl_seconds,
+            )
+        return cumulative
 
-    async def is_session_flagged(self, session_id: str) -> bool:
-        return await self._store.is_flagged(session_id)
+    @staticmethod
+    def actor_key(actor_id: str) -> str:
+        """Namespaced so an actor's accumulator can never collide with a
+        session id that happens to look like it."""
+        return f"actor::{actor_id}"
+
+    async def is_session_flagged(self, session_id: str, actor_id: str | None = None) -> bool:
+        if await self._store.is_flagged(session_id):
+            return True
+        if actor_id is not None:
+            return await self._store.is_flagged(self.actor_key(actor_id))
+        return False
+
+    async def is_actor_flagged(self, actor_id: str) -> bool:
+        return await self._store.is_flagged(self.actor_key(actor_id))
+
+    async def reset_actor(self, actor_id: str) -> None:
+        await self._store.reset_session(self.actor_key(actor_id))
 
     async def reset_session(self, session_id: str) -> None:
         await self._store.reset_session(session_id)

@@ -18,6 +18,9 @@ Usage:
 
     # Redis (ready-made)
     backend = RedisStateBackend.from_url("redis://redis-service:6379/0")
+
+    # Redis Cluster
+    backend = RedisStateBackend.from_cluster_url("redis://redis-cluster:6379")
     pipeline = SecurityPipeline(state_backend=backend, ...)
 
     # Any other technology: implement the two store interfaces from
@@ -35,7 +38,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .sessions.stores import NonceStore, SessionStore
+from .sessions.stores import NonceStore, ProvenanceStore, SessionStore
 
 try:
     from redis.asyncio import Redis
@@ -53,6 +56,13 @@ class StateBackend:
 
     nonce_store: NonceStore
     session_store: SessionStore
+    # Optional third store, needed only for ingest-time provenance
+    # (services/ingest_guard.py). Left None rather than defaulted to an
+    # in-memory instance on purpose: a provenance store that forgets on
+    # restart turns verified retrievals into unverified ones without
+    # anything failing, which is exactly the kind of silent downgrade this
+    # library tries not to ship.
+    provenance_store: ProvenanceStore | None = None
 
     async def aclose(self) -> None:
         """Override in subclasses that own an underlying connection/pool
@@ -61,9 +71,21 @@ class StateBackend:
 
 class RedisStateBackend(StateBackend):
     """Ready-made StateBackend on Redis: atomic Lua scripts for replay
-    tracking and rate/risk counters. See redis_stores.py for details."""
+    tracking and rate/risk counters. See redis_stores.py for details.
 
-    def __init__(self, redis_client: "Redis", key_prefix: str = "sentinel:", owns_client: bool = False):
+    Works on a single node and on Redis Cluster. On a cluster the keys a
+    script touches together must share a hash slot, so session keys are
+    wrapped in a hash tag; the topology is detected on first use, and
+    `hash_tags` (True / False / "auto") overrides that decision. Use
+    `from_cluster_url` to have the backend build the cluster client too."""
+
+    def __init__(
+        self,
+        redis_client: "Redis",
+        key_prefix: str = "sentinel:",
+        owns_client: bool = False,
+        hash_tags: bool | str = "auto",
+    ):
         from .sessions.redis_stores import RedisNonceStore, RedisSessionStore
 
         if Redis is None:
@@ -71,15 +93,24 @@ class RedisStateBackend(StateBackend):
                 "The 'redis' package is required for RedisStateBackend. "
                 "Install with: pip install 'llm-security-pipeline[redis]'"
             )
+        from .sessions.redis_stores import RedisProvenanceStore
+
         super().__init__(
             nonce_store=RedisNonceStore(redis_client, key_prefix=f"{key_prefix}nonce:"),
-            session_store=RedisSessionStore(redis_client, key_prefix=f"{key_prefix}session:"),
+            session_store=RedisSessionStore(
+                redis_client, key_prefix=f"{key_prefix}session:", hash_tags=hash_tags,
+            ),
+            provenance_store=RedisProvenanceStore(
+                redis_client, key_prefix=f"{key_prefix}provenance:",
+            ),
         )
         self.redis_client = redis_client
         self._owns_client = owns_client
 
     @classmethod
-    def from_url(cls, url: str, key_prefix: str = "sentinel:") -> "RedisStateBackend":
+    def from_url(
+        cls, url: str, key_prefix: str = "sentinel:", hash_tags: bool | str = "auto",
+    ) -> "RedisStateBackend":
         """Create a backend that owns its own client (closed by aclose()).
         Prefer passing an existing shared client to __init__ when your
         application already manages one."""
@@ -88,7 +119,28 @@ class RedisStateBackend(StateBackend):
                 "The 'redis' package is required for RedisStateBackend. "
                 "Install with: pip install 'llm-security-pipeline[redis]'"
             )
-        return cls(Redis.from_url(url), key_prefix=key_prefix, owns_client=True)
+        return cls(Redis.from_url(url), key_prefix=key_prefix, owns_client=True, hash_tags=hash_tags)
+
+    @classmethod
+    def from_cluster_url(
+        cls, url: str, key_prefix: str = "sentinel:", **cluster_kwargs,
+    ) -> "RedisStateBackend":
+        """Same, against a Redis Cluster: builds a RedisCluster client that
+        discovers the topology from `url` and routes each command to the
+        node owning its slot. Session keys are hash-tagged automatically."""
+        try:
+            from redis.asyncio.cluster import RedisCluster
+        except ImportError as exc:
+            raise RuntimeError(
+                "The 'redis' package (>=5) is required for RedisStateBackend. "
+                "Install with: pip install 'llm-security-pipeline[redis]'"
+            ) from exc
+        return cls(
+            RedisCluster.from_url(url, **cluster_kwargs),
+            key_prefix=key_prefix,
+            owns_client=True,
+            hash_tags=True,
+        )
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -109,11 +161,16 @@ class PostgresStateBackend(StateBackend):
     """
 
     def __init__(self, pool, owns_pool: bool = False):
-        from .sessions.postgres_stores import PostgresNonceStore, PostgresSessionStore
+        from .sessions.postgres_stores import (
+            PostgresNonceStore,
+            PostgresProvenanceStore,
+            PostgresSessionStore,
+        )
 
         super().__init__(
             nonce_store=PostgresNonceStore(pool),
             session_store=PostgresSessionStore(pool),
+            provenance_store=PostgresProvenanceStore(pool),
         )
         self.pool = pool
         self._owns_pool = owns_pool
@@ -157,11 +214,16 @@ class MySQLStateBackend(StateBackend):
     """
 
     def __init__(self, pool, owns_pool: bool = False):
-        from .sessions.mysql_stores import MySQLNonceStore, MySQLSessionStore
+        from .sessions.mysql_stores import (
+            MySQLNonceStore,
+            MySQLProvenanceStore,
+            MySQLSessionStore,
+        )
 
         super().__init__(
             nonce_store=MySQLNonceStore(pool),
             session_store=MySQLSessionStore(pool),
+            provenance_store=MySQLProvenanceStore(pool),
         )
         self.pool = pool
         self._owns_pool = owns_pool

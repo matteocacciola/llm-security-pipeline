@@ -11,6 +11,9 @@ Strategy, in order of robustness:
 1. Structural normalization (works regardless of language):
    - Unicode normalization (NFKC) to neutralize homoglyph/fullwidth tricks
    - removal of zero-width / control characters used to "hide" text
+   - decoding of Unicode Tag-block "ASCII smuggling" and stripping of
+     directional overrides, both of which survive NFKC and let an
+     instruction be invisible to the human reviewing the same string
    - detection of suspicious base64/hex blocks that might hide instructions
    - explicit wrapping of the text in delimiters, so the model treats it as
      DATA and never as an INSTRUCTION (must be paired with a system prompt
@@ -47,11 +50,55 @@ _ZERO_WIDTH_CHARS = re.compile(
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
 
+# Unicode Tags block (U+E0000-U+E007F). Every printable ASCII character has
+# a counterpart here, so an entire instruction can be written in codepoints
+# that render as absolutely nothing and survive NFKC untouched — "ASCII
+# smuggling". The model reads the tokens; a human reviewing the same string
+# sees an innocuous sentence. There is no legitimate use of this block in
+# user-supplied prose (its only sanctioned role is inside flag emoji
+# sequences, which are handled by the emoji itself, not by loose tags).
+_TAG_CHARS = re.compile(r"[\U000E0000-\U000E007F]")
+
+# Directional OVERRIDES specifically: these reverse rendering order and are
+# the classic way to make text display differently from how it parses.
+# Embeddings and isolates (202A-202C, 2066-2069) are excluded — they appear
+# legitimately in mixed RTL/LTR text, so they are stripped without being
+# scored.
+_BIDI_OVERRIDES = re.compile(r"[\u202D\u202E]")
+_BIDI_FORMATTING = re.compile(r"[\u202A-\u202C\u2066-\u2069]")
+
+# Variation selectors can carry arbitrary bytes appended to a visible
+# character ("emoji smuggling"). Stripped, but not scored: VS15/VS16 occur
+# constantly in ordinary emoji usage.
+_VARIATION_SELECTORS = re.compile(r"[\uFE00-\uFE0F\U000E0100-\U000E01EF]")
+
+
+def decode_tag_characters(text: str) -> str:
+    """Map Unicode Tag codepoints back to the ASCII they stand for.
+
+    U+E0041 is a tag-encoded "A". Recovering the plaintext matters more
+    than removing it: the hidden run is where the injected instruction
+    actually lives, so it needs to reach the lexical scan rather than be
+    silently dropped.
+    """
+    return "".join(chr(ord(ch) - 0xE0000) for ch in _TAG_CHARS.findall(text))
+
+
+def find_hidden_text(text: str, min_len: int = 3) -> list[str]:
+    """Return decoded messages hidden in invisible codepoints."""
+    decoded = decode_tag_characters(text)
+    return [decoded] if len(decoded) >= min_len else []
+
 
 def normalize_text(text: str) -> str:
     """Normalize text to neutralize Unicode obfuscation tricks (homoglyphs,
-    fullwidth characters, zero-width joiners) regardless of language."""
+    fullwidth characters, zero-width joiners, tag-block smuggling,
+    directional overrides) regardless of language."""
     text = unicodedata.normalize("NFKC", text)
+    text = _TAG_CHARS.sub("", text)
+    text = _VARIATION_SELECTORS.sub("", text)
+    text = _BIDI_OVERRIDES.sub("", text)
+    text = _BIDI_FORMATTING.sub("", text)
     text = _ZERO_WIDTH_CHARS.sub("", text)
     text = _CONTROL_CHARS.sub("", text)
     return text
@@ -99,6 +146,40 @@ def wrap_as_data(text: str, tag: str = "USER_DATA") -> str:
     return f"<{tag}>\n{safe_text}\n</{tag}>"
 
 
+@dataclass(frozen=True)
+class RiskWeights:
+    """How much each signal contributes to the risk score.
+
+    The defaults encode a specific position: structural signals outweigh
+    lexical ones, because a phrase list is bypassed by paraphrasing while
+    an encoded payload or an invisible instruction is hostile whatever it
+    says. A consequence worth knowing before you change anything is that a
+    single lexical match scores `per_pattern` (0.25) and therefore does NOT
+    reach the pipeline's default block threshold of 0.6 on its own — the
+    structural `wrap_as_data` boundary is meant to be the defence there,
+    with cumulative session risk catching the repeat offender.
+
+    Whether that is right for you is a product decision, not a fact. Raise
+    `per_pattern` towards 0.6 for single-turn lexical blocking, and expect
+    to pay for it in false positives on text that legitimately quotes
+    instructions ("translate 'ignore the previous message'", "how does
+    prompt injection work"). Measure it rather than guessing: see
+    llm_security_pipeline.evaluation.
+
+        Sanitizer(weights=RiskWeights(per_pattern=0.6))
+    """
+
+    per_pattern: float = 0.25
+    max_pattern_total: float = 0.75
+    encoded_payload: float = 0.4
+    hidden_text: float = 0.4
+    bidi_override: float = 0.2
+    multiple_languages: float = 0.15
+
+
+DEFAULT_RISK_WEIGHTS = RiskWeights()
+
+
 @dataclass
 class SanitizationResult:
     original_text: str
@@ -108,6 +189,7 @@ class SanitizationResult:
     matched_patterns: list[str] = field(default_factory=list)
     matched_languages: set[str] = field(default_factory=set)
     decoded_payload_hits: list[str] = field(default_factory=list)
+    hidden_text_hits: list[str] = field(default_factory=list)
     blocked: bool = False
     source_id: str | None = None  # e.g. "user_message", "web:https://...", "rag_chunk_12"
 
@@ -138,11 +220,13 @@ class Sanitizer:
         pattern_config_path: str | None = None,
         include_default_patterns: bool = True,
         registry: PatternRegistry | None = None,
+        weights: "RiskWeights | None" = None,
     ):
         self.registry = registry or PatternRegistry.load(
             custom_config_path=pattern_config_path,
             include_defaults=include_default_patterns,
         )
+        self.weights = weights or DEFAULT_RISK_WEIGHTS
 
     def scan_text(
         self,
@@ -155,6 +239,12 @@ class Sanitizer:
         of its language or origin. Use `tag`/`source_id` to distinguish
         direct user input from external content (web pages, RAG chunks,
         tool outputs) when scanning for indirect prompt injection."""
+        # Invisible codepoints are read off the raw text: normalization is
+        # about to remove them, and their decoded contents are exactly what
+        # the lexical scan needs to see.
+        hidden_hits = find_hidden_text(text)
+        has_bidi_override = bool(_BIDI_OVERRIDES.search(text))
+
         normalized = normalize_text(text)
         injection_patterns = self.registry.injection_patterns
 
@@ -166,6 +256,16 @@ class Sanitizer:
                 if pattern.search(normalized):
                     matched_patterns.append(name)
                     matched_languages.add(lang)
+
+        # Anything smuggled in invisible characters gets the same lexical
+        # treatment as visible text.
+        for hidden in hidden_hits:
+            hidden_norm = normalize_text(hidden)
+            for lang, patterns in injection_patterns.items():
+                for name, pattern in patterns.items():
+                    if pattern.search(hidden_norm):
+                        matched_patterns.append(f"[hidden] {name}")
+                        matched_languages.add(lang)
 
         decoded_hits = find_encoded_payloads(normalized)
         # Re-run the lexical scan on decoded content too: a base64 payload
@@ -181,12 +281,21 @@ class Sanitizer:
         # Scoring: structural signals (encoded payloads, multiple languages
         # hit at once) weigh more than single lexical phrases, which are
         # easily bypassed through paraphrasing.
+        weights = self.weights
         score = 0.0
-        score += min(len(matched_patterns) * 0.25, 0.75)
+        score += min(len(matched_patterns) * weights.per_pattern, weights.max_pattern_total)
         if decoded_hits:
-            score += 0.4
+            score += weights.encoded_payload
+        if hidden_hits:
+            # Weighted as high as an encoded payload and deliberately not
+            # conditioned on what the hidden text says: text written to be
+            # unreadable by the human in the loop is hostile by
+            # construction, whatever it turns out to contain.
+            score += weights.hidden_text
+        if has_bidi_override:
+            score += weights.bidi_override
         if len(matched_languages) > 1:
-            score += 0.15  # suspicious code-mixing signal
+            score += weights.multiple_languages  # suspicious code-mixing signal
         score = min(score, 1.0)
 
         return SanitizationResult(
@@ -197,6 +306,7 @@ class Sanitizer:
             matched_patterns=matched_patterns,
             matched_languages=matched_languages,
             decoded_payload_hits=decoded_hits,
+            hidden_text_hits=hidden_hits,
             blocked=score >= threshold,
             source_id=source_id,
         )

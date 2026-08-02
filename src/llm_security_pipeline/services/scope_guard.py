@@ -39,6 +39,26 @@ class CapabilityToken:
     payload: dict
     signature: str
 
+    @property
+    def subject(self) -> str | None:
+        """The authenticated end user this token was issued for, if any.
+
+        Inside the signed payload, so it cannot be swapped for someone
+        else's without invalidating the token.
+        """
+        return self.payload.get("subject")
+
+    @property
+    def constraints(self) -> dict:
+        """Signed, caller-defined limits carried alongside the scope (for
+        example `{"account_id": "42"}`).
+
+        The library transports and protects these; it cannot enforce them,
+        because whether account 42 belongs to this user is a question about
+        your data model. See `check_constraints`.
+        """
+        return self.payload.get("constraints") or {}
+
     def to_str(self) -> str:
         raw = json.dumps(self.payload, sort_keys=True).encode()
         return raw.hex() + "." + self.signature
@@ -57,8 +77,19 @@ class ScopeGuard:
     only `authorize`, which needs to consult shared usage state, is async.
     """
 
-    def __init__(self, secret_key: bytes | None = None, nonce_store: NonceStore | None = None):
+    def __init__(
+        self,
+        secret_key: bytes | None = None,
+        nonce_store: NonceStore | None = None,
+        require_subject: bool = False,
+    ):
         self._secret_key = secret_key or secrets.token_bytes(32)
+        # When True, a token must name the end user it was issued for, and
+        # that user must be presented again at authorization. This is what
+        # stops a leaked token from being spendable by whoever finds it —
+        # the confused-deputy case, where the agent acts with the token's
+        # authority regardless of who is asking now.
+        self._require_subject = require_subject
         # Defaults to an in-memory store, which is only safe for a single
         # process. Pass a RedisNonceStore explicitly for any multi-process
         # or multi-instance deployment.
@@ -74,7 +105,22 @@ class ScopeGuard:
         scopes: list[str],
         ttl_seconds: int = 300,
         max_uses: int = 1,
+        subject: str | None = None,
+        constraints: dict | None = None,
     ) -> CapabilityToken:
+        """Issue a token. `subject` binds it to an authenticated end user;
+        `constraints` carries signed, caller-defined limits.
+
+        The library never authenticates `subject` — it receives it. What it
+        guarantees is that the value cannot be altered after issuance and
+        must match at authorization.
+        """
+        if self._require_subject and subject is None:
+            raise ScopeError(
+                "This ScopeGuard requires tokens to be bound to a subject "
+                "(require_subject=True), but issue_token was called without one. "
+                "Pass the authenticated end-user identifier as subject=."
+            )
         payload = {
             "agent_id": agent_id,
             "scopes": sorted(set(scopes)),
@@ -82,6 +128,8 @@ class ScopeGuard:
             "expires_at": time.time() + ttl_seconds,
             "nonce": secrets.token_hex(16),
             "max_uses": max_uses,
+            "subject": subject,
+            "constraints": dict(constraints or {}),
         }
         signature = self._sign(payload)
         return CapabilityToken(payload=payload, signature=signature)
@@ -96,7 +144,9 @@ class ScopeGuard:
         if not hmac.compare_digest(expected, token.signature):
             raise ScopeError("Invalid token signature: possible tampering.")
 
-    async def authorize(self, token: CapabilityToken, action: str) -> None:
+    async def authorize(
+        self, token: CapabilityToken, action: str, subject: str | None = None,
+    ) -> None:
         """Verify that the token is valid, not expired, not reused beyond
         its allowed limit, and that the requested action is within the
         granted scope. Raises ScopeError if any condition is not met.
@@ -105,6 +155,25 @@ class ScopeGuard:
         processes, so it's the only part delegated to the nonce store.
         """
         self._verify_signature(token)
+
+        bound_subject = token.payload.get("subject")
+        if bound_subject is not None:
+            if subject is None:
+                raise ScopeError(
+                    "Token is bound to a subject but no subject was presented at "
+                    "authorization. Pass the authenticated end user as subject=."
+                )
+            if not hmac.compare_digest(str(bound_subject), str(subject)):
+                raise ScopeError(
+                    "Token was issued for a different end user than the one "
+                    "presenting it (possible token theft or replay across users)."
+                )
+        elif self._require_subject:
+            raise ScopeError(
+                "This ScopeGuard requires subject-bound tokens, but this token "
+                "carries no subject. It was issued by a differently-configured "
+                "authority, or before binding was enabled."
+            )
 
         now = time.time()
         if now > token.payload["expires_at"]:
@@ -123,10 +192,31 @@ class ScopeGuard:
         if uses > token.payload["max_uses"]:
             raise ScopeError("Token already used the maximum allowed number of times (possible replay).")
 
-    async def guarded_call(self, token: CapabilityToken, action: str, func, *args, **kwargs):
+    @staticmethod
+    def check_constraints(token: CapabilityToken, **actual) -> None:
+        """Compare the token's signed constraints against the values a call
+        is actually about, raising if any differ.
+
+        This is the mechanism, not the policy. It answers "does this call
+        match what the token was issued for", which the library can verify
+        cryptographically. It does not answer "should this user be allowed
+        near account 42", which depends on your data model and stays in
+        your tool.
+        """
+        for key, expected in token.constraints.items():
+            if key not in actual:
+                raise ScopeError(f"Token constrains '{key}' but the call did not supply it.")
+            if str(actual[key]) != str(expected):
+                raise ScopeError(
+                    f"Token was issued for {key}={expected!r}, call is for {actual[key]!r}."
+                )
+
+    async def guarded_call(
+        self, token: CapabilityToken, action: str, func, *args, subject: str | None = None, **kwargs,
+    ):
         """Convenience wrapper: executes func(*args, **kwargs) only if authorized.
         `func` may be sync or async; async functions are awaited."""
-        await self.authorize(token, action)
+        await self.authorize(token, action, subject=subject)
         result = func(*args, **kwargs)
         if hasattr(result, "__await__"):
             result = await result

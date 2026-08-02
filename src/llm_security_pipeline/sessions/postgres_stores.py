@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import time
 
-from .stores import NonceStore, SessionStore
+from .stores import NonceStore, ProvenanceRecord, ProvenanceStore, SessionStore
 
 try:
     import asyncpg
@@ -60,6 +60,20 @@ CREATE TABLE IF NOT EXISTS sentinel_risk (
     last_update DOUBLE PRECISION NOT NULL,
     flagged     BOOLEAN NOT NULL DEFAULT FALSE,
     expires_at  DOUBLE PRECISION NOT NULL
+);
+
+-- Ingest provenance. Deliberately has no expires_at: unlike every other
+-- table here it is not a counter with a TTL. A record has to outlive
+-- whatever session retrieved the document, and an expired record is
+-- indistinguishable from a document that was never scanned at all.
+CREATE TABLE IF NOT EXISTS sentinel_provenance (
+    document_id  TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    source_id    TEXT NOT NULL,
+    trust        TEXT NOT NULL,
+    decision     TEXT NOT NULL,
+    risk_score   DOUBLE PRECISION NOT NULL,
+    recorded_at  DOUBLE PRECISION NOT NULL
 );
 """
 
@@ -206,3 +220,63 @@ class PostgresSessionStore(SessionStore):
         async with self._pool.acquire() as conn:
             await conn.execute("DELETE FROM sentinel_counters WHERE session_id = $1", session_id)
             await conn.execute("DELETE FROM sentinel_risk WHERE session_id = $1", session_id)
+
+
+class PostgresProvenanceStore(ProvenanceStore):
+    """Ingest verdicts in a single upserted row per document.
+
+    No TTL and no opportunistic cleanup, unlike the other Postgres stores
+    in this module: provenance is a durable record, not expiring state.
+    Deleting a row means the next retrieval of that document reports
+    `no_provenance_record`, so removal belongs to whatever removes the
+    document from your index.
+    """
+
+    def __init__(self, pool: "asyncpg.Pool"):
+        _require_asyncpg()
+        self._pool = pool
+
+    async def record(self, record: ProvenanceRecord) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO sentinel_provenance
+                    (document_id, content_hash, source_id, trust, decision, risk_score, recorded_at)
+                VALUES ($1, $2, $3, $4, $5, $6::float8, $7::float8)
+                ON CONFLICT (document_id) DO UPDATE SET
+                    content_hash = EXCLUDED.content_hash,
+                    source_id    = EXCLUDED.source_id,
+                    trust        = EXCLUDED.trust,
+                    decision     = EXCLUDED.decision,
+                    risk_score   = EXCLUDED.risk_score,
+                    recorded_at  = EXCLUDED.recorded_at
+                """,
+                record.document_id, record.content_hash, record.source_id,
+                record.trust, record.decision, record.risk_score, record.recorded_at,
+            )
+
+    async def get(self, document_id: str) -> ProvenanceRecord | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT document_id, content_hash, source_id, trust, decision,
+                       risk_score, recorded_at
+                FROM sentinel_provenance WHERE document_id = $1
+                """,
+                document_id,
+            )
+        if row is None:
+            return None
+        return ProvenanceRecord(
+            document_id=row["document_id"],
+            content_hash=row["content_hash"],
+            source_id=row["source_id"],
+            trust=row["trust"],
+            decision=row["decision"],
+            risk_score=float(row["risk_score"]),
+            recorded_at=float(row["recorded_at"]),
+        )
+
+    async def delete(self, document_id: str) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute("DELETE FROM sentinel_provenance WHERE document_id = $1", document_id)

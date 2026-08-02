@@ -41,7 +41,7 @@ import asyncio
 import random
 import time
 
-from .stores import NonceStore, SessionStore
+from .stores import NonceStore, ProvenanceRecord, ProvenanceStore, SessionStore
 
 try:
     import aiomysql
@@ -79,6 +79,20 @@ _DDL_STATEMENTS = [
         last_update DOUBLE NOT NULL,
         flagged     BOOLEAN NOT NULL DEFAULT FALSE,
         expires_at  DOUBLE NOT NULL
+    )
+    """,
+    # Ingest provenance. No expires_at on purpose: unlike the tables above
+    # this is a durable record, not expiring state, and an expired record
+    # would be indistinguishable from a document that was never scanned.
+    """
+    CREATE TABLE IF NOT EXISTS sentinel_provenance (
+        document_id  VARCHAR(255) PRIMARY KEY,
+        content_hash VARCHAR(64) NOT NULL,
+        source_id    VARCHAR(255) NOT NULL,
+        trust        VARCHAR(32) NOT NULL,
+        decision     VARCHAR(32) NOT NULL,
+        risk_score   DOUBLE NOT NULL,
+        recorded_at  DOUBLE NOT NULL
     )
     """,
 ]
@@ -318,4 +332,66 @@ class MySQLSessionStore(SessionStore):
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM sentinel_counters WHERE session_id = %s", (session_id,))
                 await cur.execute("DELETE FROM sentinel_risk WHERE session_id = %s", (session_id,))
+            await conn.commit()
+
+
+class MySQLProvenanceStore(ProvenanceStore):
+    """Ingest verdicts, one upserted row per document.
+
+    Needs neither the deadlock retry nor the row locks the other MySQL
+    stores in this module use: there is no read-modify-write here, just a
+    single idempotent upsert, so InnoDB has nothing to serialise.
+    """
+
+    def __init__(self, pool: "aiomysql.Pool"):
+        _require_aiomysql()
+        self._pool = pool
+
+    async def record(self, record: ProvenanceRecord) -> None:
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO sentinel_provenance
+                        (document_id, content_hash, source_id, trust, decision, risk_score, recorded_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        content_hash = VALUES(content_hash),
+                        source_id    = VALUES(source_id),
+                        trust        = VALUES(trust),
+                        decision     = VALUES(decision),
+                        risk_score   = VALUES(risk_score),
+                        recorded_at  = VALUES(recorded_at)
+                    """,
+                    (record.document_id, record.content_hash, record.source_id,
+                     record.trust, record.decision, record.risk_score, record.recorded_at),
+                )
+            await conn.commit()
+
+    async def get(self, document_id: str) -> ProvenanceRecord | None:
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT document_id, content_hash, source_id, trust, decision,
+                           risk_score, recorded_at
+                    FROM sentinel_provenance WHERE document_id = %s
+                    """,
+                    (document_id,),
+                )
+                row = await cur.fetchone()
+        if row is None:
+            return None
+        return ProvenanceRecord(
+            document_id=row[0], content_hash=row[1], source_id=row[2],
+            trust=row[3], decision=row[4], risk_score=float(row[5]),
+            recorded_at=float(row[6]),
+        )
+
+    async def delete(self, document_id: str) -> None:
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM sentinel_provenance WHERE document_id = %s", (document_id,),
+                )
             await conn.commit()

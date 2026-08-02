@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 # ---------------------------------------------------------------------------
@@ -141,3 +141,87 @@ class InMemorySessionStore(SessionStore):
         self._tool_calls.pop(session_id, None)
         self._risk.pop(session_id, None)
         self._flagged.discard(session_id)
+
+
+# ---------------------------------------------------------------------------
+# Provenance store (backs ingest_guard.py): what was decided about a
+# document when it entered the index, and what its bytes were at the time.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ProvenanceRecord:
+    document_id: str
+    content_hash: str
+    source_id: str
+    trust: str
+    decision: str
+    risk_score: float
+    recorded_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "document_id": self.document_id,
+            "content_hash": self.content_hash,
+            "source_id": self.source_id,
+            "trust": self.trust,
+            "decision": self.decision,
+            "risk_score": str(self.risk_score),
+            "recorded_at": str(self.recorded_at),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ProvenanceRecord":
+        def _text(value) -> str:
+            return value.decode() if isinstance(value, bytes) else str(value)
+
+        plain = {_text(k): _text(v) for k, v in data.items()}
+        return cls(
+            document_id=plain["document_id"],
+            content_hash=plain["content_hash"],
+            source_id=plain["source_id"],
+            trust=plain["trust"],
+            decision=plain["decision"],
+            risk_score=float(plain["risk_score"]),
+            recorded_at=float(plain["recorded_at"]),
+        )
+
+
+class ProvenanceStore(ABC):
+    """Records the ingest-time verdict for a document so retrieval can
+    check that what came back is what was approved.
+
+    Unlike the counters in the other stores this is not ephemeral: a record
+    has to outlive the document it describes, so implementations should not
+    put a short TTL on it. There is no in-memory-is-fine caveat here for a
+    different reason than usual — the risk is not that limits become
+    per-process, it is that a restart silently turns every verified
+    retrieval into an unverified one.
+    """
+
+    @abstractmethod
+    async def record(self, record: ProvenanceRecord) -> None:
+        ...
+
+    @abstractmethod
+    async def get(self, document_id: str) -> ProvenanceRecord | None:
+        ...
+
+    @abstractmethod
+    async def delete(self, document_id: str) -> None:
+        ...
+
+
+class InMemoryProvenanceStore(ProvenanceStore):
+    """Single-process implementation for local development and unit tests."""
+
+    def __init__(self):
+        self._records: dict[str, ProvenanceRecord] = {}
+
+    async def record(self, record: ProvenanceRecord) -> None:
+        self._records[record.document_id] = record
+
+    async def get(self, document_id: str) -> ProvenanceRecord | None:
+        return self._records.get(document_id)
+
+    async def delete(self, document_id: str) -> None:
+        self._records.pop(document_id, None)

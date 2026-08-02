@@ -10,6 +10,7 @@ dependencies = [
 
 [project.optional-dependencies]
 redis = ["redis>=5.0"]
+images = ["pillow>=10"]
 postgres = ["asyncpg>=0.29"]
 mysql = ["aiomysql>=0.2"]
 
@@ -27,6 +28,7 @@ addopts = "--cov=llm_security_pipeline --cov-report=term-missing --cov-report=xm
 markers = [
     "integration: exercises a real shared-state backend and real OS processes",
     "redis: integration test requires a reachable Redis instance; skipped automatically otherwise",
+    "redis_cluster: integration test requires a reachable cluster-enabled Redis; skipped automatically otherwise",
     "postgres: integration test requires a reachable PostgreSQL instance; skipped automatically otherwise",
     "mysql: integration test requires a reachable MySQL/MariaDB instance; skipped automatically otherwise",
 ]
