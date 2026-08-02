@@ -235,13 +235,19 @@ wheels = [
 
 [[package]]
 name = "llm-security-pipeline"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },
 ]
 
 [package.optional-dependencies]
+all = [
+    { name = "aiomysql" },
+    { name = "asyncpg" },
+    { name = "pillow" },
+    { name = "redis" },
+]
 images = [
     { name = "pillow" },
 ]
@@ -267,13 +273,17 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiomysql", marker = "extra == 'all'", specifier = ">=0.2" },
     { name = "aiomysql", marker = "extra == 'mysql'", specifier = ">=0.2" },
+    { name = "asyncpg", marker = "extra == 'all'", specifier = ">=0.29" },
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.29" },
+    { name = "pillow", marker = "extra == 'all'", specifier = ">=10" },
     { name = "pillow", marker = "extra == 'images'", specifier = ">=10" },
     { name = "pydantic", specifier = ">=2.13.4" },
+    { name = "redis", marker = "extra == 'all'", specifier = ">=5.0" },
     { name = "redis", marker = "extra == 'redis'", specifier = ">=5.0" },
 ]
-provides-extras = ["redis", "images", "postgres", "mysql"]
+provides-extras = ["redis", "images", "postgres", "mysql", "all"]
 
 [package.metadata.requires-dev]
 dev = [
