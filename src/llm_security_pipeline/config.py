@@ -80,6 +80,7 @@ class ExfilConfig:
     allowed_hosts: tuple[str, ...] = ()
     scan_output: bool = True
     scan_tool_call_arguments: bool = True
+    scan_tool_results: bool = True
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,9 @@ class PipelineConfig:
     # config file, and it does not need to be shared across processes —
     # each process watches for the one it planted.
     canary: bool = False
+    # Which service this deployment is, for capability tokens. Not a
+    # secret, so it belongs here; the key does not. See ScopeGuard.
+    audience: str | None = None
     thresholds: ThresholdConfig = field(default_factory=ThresholdConfig)
     patterns: PatternConfig = field(default_factory=PatternConfig)
     exfil: ExfilConfig = field(default_factory=ExfilConfig)
@@ -159,6 +163,7 @@ class PipelineConfig:
             "enforcement": self.enforcement,
             "system_prompt": self.system_prompt,
             "canary": self.canary or None,
+            "scope_audience": self.audience,
             "input_risk_threshold": self.thresholds.input_risk,
             "output_overlap_threshold": self.thresholds.output_overlap,
             "pii_config_path": self.patterns.pii_config_path,
@@ -168,6 +173,7 @@ class PipelineConfig:
             "exfil_allowed_hosts": list(self.exfil.allowed_hosts) or None,
             "scan_output_for_exfil": self.exfil.scan_output,
             "scan_tool_call_arguments": self.exfil.scan_tool_call_arguments,
+            "scan_tool_results": self.exfil.scan_tool_results,
             "external_scan_parallel_min_chunks": self.parallelism.external_scan_parallel_min_chunks,
             "large_input_offload_threshold_chars": self.parallelism.large_input_offload_threshold_chars,
             "session_limits": self.session_limits,

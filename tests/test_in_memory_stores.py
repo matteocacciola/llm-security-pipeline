@@ -93,8 +93,8 @@ async def test_session_store_risk_decay_reduces_cumulative_value():
 
     await store.add_risk(session_id, risk_delta=1.0, decay_per_second=1.0, flag_threshold=100.0, ttl_seconds=60)
     # Back-date the last-update timestamp to simulate 10 elapsed seconds of decay.
-    current, _last_update = store._risk[session_id]
-    store._risk[session_id] = (current, time.time() - 10)
+    current, _last_update, expires_at = store._risk[session_id]
+    store._risk[session_id] = (current, time.time() - 10, expires_at)
 
     updated = await store.add_risk(
         session_id, risk_delta=0.0, decay_per_second=1.0, flag_threshold=100.0, ttl_seconds=60,

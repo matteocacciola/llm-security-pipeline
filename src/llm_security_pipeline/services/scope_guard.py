@@ -85,6 +85,17 @@ MIN_KEY_BYTES = 32
 DEFAULT_KEY_ID = "default"
 
 
+_AUDIENCE_RE = re.compile(r"\A[A-Za-z0-9._:/-]{1,128}\Z")
+
+
+def _check_audience(audience: str) -> str:
+    if not isinstance(audience, str) or not _AUDIENCE_RE.match(audience):
+        raise ValueError(
+            f"audience must be 1-128 characters of [A-Za-z0-9._:/-], got {audience!r}."
+        )
+    return audience
+
+
 def _check_kid(kid: str, where: str) -> str:
     if not isinstance(kid, str) or not _KID_RE.match(kid):
         raise ValueError(
@@ -263,6 +274,10 @@ class CapabilityToken:
         return self.payload.get("kid")
 
     @property
+    def audience(self) -> str | None:
+        return self.payload.get("aud")
+
+    @property
     def subject(self) -> str | None:
         """The authenticated end user this token was issued for, if any.
 
@@ -355,7 +370,17 @@ class ScopeGuard:
         keyring: SigningKeyring | None = None,
         failure_policy: FailurePolicy | None = None,
         resilience: ResilientBackend | None = None,
+        audience: str | None = None,
     ):
+        # Which service this guard IS. Tokens it issues name it, and tokens
+        # it verifies must name it back. The README tells you to give every
+        # process the same signing key — and it has to — but the moment
+        # two different services share that key, each accepts the other's
+        # tokens unless something in the token says which service it was
+        # for. A subject binds a token to a user; an audience binds it to
+        # a service. Optional for the single-service case, which is where
+        # nearly everyone starts; set it the day a second service appears.
+        self._audience = _check_audience(audience) if audience is not None else None
         if secret_key is not None and keyring is not None:
             raise ValueError(
                 "Pass either secret_key or keyring, not both. secret_key is shorthand "
@@ -402,6 +427,10 @@ class ScopeGuard:
         # Refusing a tool call is bounded and recoverable; an unbounded
         # capability token is not.
         self._resilience = resilience or ResilientBackend(failure_policy)
+
+    @property
+    def audience(self) -> str | None:
+        return self._audience
 
     @property
     def keyring(self) -> SigningKeyring:
@@ -455,6 +484,11 @@ class ScopeGuard:
             # repointing would help, since producing a signature under that
             # key is the part an attacker cannot do.
             "kid": kid,
+            # Also signed. None when this guard has no audience, which is
+            # the single-service case; a verifying guard with an audience
+            # rejects a None here, so a token minted "for nobody" cannot
+            # be spent at a service that expects to be named.
+            "aud": self._audience,
         }
         signature = self._sign_bytes(canonical_payload_bytes(payload), key)
         return CapabilityToken(payload=payload, signature=signature)
@@ -511,6 +545,24 @@ class ScopeGuard:
         processes, so it's the only part delegated to the nonce store.
         """
         self._verify_signature(token)
+
+        # Audience before subject: "wrong service" is the more fundamental
+        # mismatch, and its error should not be masked by a subject check
+        # that happens to also fail.
+        if self._audience is not None:
+            presented = token.payload.get("aud")
+            if presented is None:
+                raise ScopeError(
+                    f"Token names no audience but this guard is {self._audience!r}. "
+                    "It was issued by a guard without an audience — a token for "
+                    "nobody in particular is not a token for this service."
+                )
+            if not hmac.compare_digest(str(presented), self._audience):
+                raise ScopeError(
+                    f"Token was issued for {presented!r}, not for {self._audience!r}. "
+                    "The two services share a signing key; the audience is what "
+                    "keeps their tokens from being interchangeable."
+                )
 
         bound_subject = token.payload.get("subject")
         if bound_subject is not None:

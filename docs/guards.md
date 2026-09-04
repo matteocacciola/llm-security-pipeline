@@ -55,6 +55,27 @@ belongs with deleting the document from your index.
 Batch ingestion (`ingest_batch`) parallelizes scanning across the process
 pool on the same terms as `pre_process_external_batch`.
 
+## Tool results
+
+`authorized_tool_call` checks the arguments on the way out (for URLs that
+would exfiltrate) and, by default, **the return value on the way back**. A
+tool that fetches a web page returns the web page, and the web page is the
+indirect-injection surface this library exists for; the arguments being
+clean says nothing about it.
+
+Every string in the result, however nested, goes through the same path a
+RAG chunk takes — lexical scan, detectors, audit as
+`external_content_scan` with `source_id="tool:<action>"`, session risk
+charged — and a result that trips the threshold raises `ToolResultBlocked`
+carrying the scan and the raw output, for a caller that wants to log it or
+show it to the user without handing it to the model. The call itself is
+audited as *allowed*: it was, and it ran; what is refused is feeding its
+output onward. Shadow mode returns the result and records `would_block`.
+`scan_tool_results=False` turns it off.
+
+This is detection in front of the structural defence, not instead of it:
+put the result through `wrap_as_data` when you build the prompt.
+
 ## Non-text input (`MediaScanner`)
 
 No OCR engine is bundled, and that is a considered choice rather than a
@@ -108,6 +129,18 @@ does), but it turns verbatim leakage from a probability into a certainty
 at zero cost. The only way to get it wrong is to send the original prompt
 instead of the planted one, which is why the pipeline exposes the planted
 one by name.
+
+## Every input surface, the same checks
+
+A detector registered on the pipeline runs on typed messages
+(`pre_process`), retrieved content (`pre_process_external`), tool results
+(above), and the text recovered from a media payload
+(`pre_process_media`) — where it matters most, since a document is
+paraphrased prose written to be read. The media scanner also judges
+against the pipeline's `input_risk_threshold`, not a default of its own.
+`MediaScanResult.risk_score` stays the lexical score and
+`combined_risk_score` is what the decision was taken on, as on
+`PreProcessResult`.
 
 ## Streaming output
 

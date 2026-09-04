@@ -80,6 +80,31 @@ rather than over a re-serialization of the parsed payload, so verification
 does not quietly depend on your JSON encoder producing byte-identical
 output to the issuer's.
 
+## Audience: which service a token is for
+
+The deployment notes say to give every process the same signing key, and
+that is right — but the moment two *different services* share that key,
+each accepts the other's tokens. A token minted for the orders service is
+spendable at the payments service if the scope name happens to match. A
+subject binds a token to a user; an audience binds it to a service.
+
+```python
+orders   = ScopeGuard(secret_key=KEY, audience="orders")
+payments = ScopeGuard(secret_key=KEY, audience="payments")
+
+token = orders.issue_token("bot", ["read"])
+await payments.authorize(token, "read")   # ScopeError: issued for 'orders', not for 'payments'
+```
+
+`aud` is inside the signed payload, so it cannot be rewritten. A guard with
+an audience rejects a token that names none — a token "for nobody" is not a
+token for this service — while a guard *without* an audience accepts any
+token, so a single-service deployment needs no change. It is checked before
+the subject, so "wrong service" is not masked by a subject mismatch that
+happens to fail too. The pipeline takes it as `scope_audience=`, and
+`PipelineConfig` as `audience` (it is an identity, not a secret, so it
+belongs in config; the key does not).
+
 ## Rotating the signing key
 
 A capability token is signed once and verified later, possibly in another

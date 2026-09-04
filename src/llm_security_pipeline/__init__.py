@@ -1,6 +1,7 @@
 from .config_loader import PatternRegistry, PatternConfigError, load_pattern_file
 from .pipeline import (
     AUDIT_SCHEMA_VERSION,
+    ToolResultBlocked,
     GuardedStream,
     SecurityPipeline,
     PreProcessResult,
@@ -225,6 +226,7 @@ __all__ = [
     "StreamDelta",
     "GuardedStream",
     "AUDIT_SCHEMA_VERSION",
+    "ToolResultBlocked",
     "DEFAULT_HOLDBACK_CHARS",
     "DEFAULT_DETECTION_TAIL_CHARS",
     "SemanticDetector",

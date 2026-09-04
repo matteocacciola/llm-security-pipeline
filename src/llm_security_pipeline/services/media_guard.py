@@ -74,6 +74,13 @@ class MediaScanResult:
     risk_score: float = 0.0
     blocked: bool = False
     extractor_errors: dict[str, str] = field(default_factory=dict)
+    # Filled by the pipeline when semantic detectors are registered. As on
+    # PreProcessResult, `risk_score` stays the lexical score and the block
+    # decision is taken on `combined_risk_score`, so the record can say
+    # which signal fired. Typed loosely to keep this module free of the
+    # detectors import; the pipeline owns both.
+    detectors: object | None = None
+    combined_risk_score: float = 0.0
 
     @property
     def matched_patterns(self) -> list[str]:
@@ -313,5 +320,6 @@ class MediaScanner:
             result.scans.append(scan)
 
         result.risk_score = max((s.risk_score for s in result.scans), default=0.0)
+        result.combined_risk_score = result.risk_score
         result.blocked = result.risk_score >= self.threshold
         return result

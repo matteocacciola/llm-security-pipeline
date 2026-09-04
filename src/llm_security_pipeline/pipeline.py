@@ -136,7 +136,7 @@ logger = logging.getLogger(__name__)
 # Stamped on every audit event. Bump it when a field is added, renamed or
 # changes meaning, so a consumer parsing the stream can branch on it instead
 # of discovering the change when its parser breaks. History in CHANGELOG.md.
-AUDIT_SCHEMA_VERSION = 2
+AUDIT_SCHEMA_VERSION = 3
 
 # Degradations collected for the request currently being handled. A
 # ContextVar rather than an attribute because one SecurityPipeline serves
@@ -258,6 +258,51 @@ def _scan_output(
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
+
+class ToolResultBlocked(Exception):
+    """A tool ran, and what it returned looked like an injection.
+
+    Not a ScopeError: the call was authorized and happened. What is
+    refused is feeding its output to the model, which is the whole point —
+    a tool that fetches a web page returns the web page, and the web page
+    is the indirect-injection surface this library exists for.
+    `scan` carries the verdict; `output` the raw result, for a caller that
+    wants to log it or return it to the user without passing it to the
+    model.
+    """
+
+    def __init__(self, action: str, scan: SanitizationResult, output: object):
+        self.action = action
+        self.scan = scan
+        self.output = output
+        super().__init__(
+            f"Result of tool {action!r} was blocked before reaching the model "
+            f"(risk {scan.risk_score:.2f}; {', '.join(scan.matched_patterns) or 'detector'})."
+        )
+
+
+def _strings_in(value: object, _depth: int = 0) -> list[str]:
+    """Every string a tool result carries, however nested. What a model
+    reads is text; a dict of text is a dict of injection surfaces."""
+    if _depth > 8:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, bytes):
+        try:
+            return [value.decode("utf-8")]
+        except UnicodeDecodeError:
+            return []
+    if isinstance(value, dict):
+        out: list[str] = []
+        for k, v in value.items():
+            out.extend(_strings_in(k, _depth + 1))
+            out.extend(_strings_in(v, _depth + 1))
+        return out
+    if isinstance(value, (list, tuple, set)):
+        return [t for item in value for t in _strings_in(item, _depth + 1)]
+    return []
+
 
 class GuardedStream:
     """A model token stream with the output guard in front of it.
@@ -406,12 +451,14 @@ class SecurityPipeline:
         scope_guard: ScopeGuard | None = None,
         scope_secret_key: bytes | None = None,
         scope_keyring: SigningKeyring | None = None,
+        scope_audience: str | None = None,
         sanitizer: Sanitizer | None = None,
         output_guard: OutputGuard | None = None,
         exfil_guard: ExfilGuard | None = None,
         exfil_allowed_hosts: list[str] | None = None,
         scan_output_for_exfil: bool = True,
         scan_tool_call_arguments: bool = True,
+        scan_tool_results: bool = True,
         ingest_guard: IngestGuard | None = None,
         media_scanner: MediaScanner | None = None,
         enforcement: str = "enforce",
@@ -472,10 +519,12 @@ class SecurityPipeline:
             )
         self.session_identity = session_identity or "untrusted"
 
-        if scope_guard is not None and (scope_secret_key is not None or scope_keyring is not None):
+        if scope_guard is not None and (
+            scope_secret_key is not None or scope_keyring is not None or scope_audience is not None
+        ):
             raise ValueError(
-                "Pass either scope_guard or scope_secret_key/scope_keyring, not both — "
-                "the key belongs to the guard you supplied."
+                "Pass either scope_guard or scope_secret_key/scope_keyring/scope_audience, "
+                "not both — the key and the audience belong to the guard you supplied."
             )
         if scope_secret_key is not None and scope_keyring is not None:
             raise ValueError(
@@ -521,6 +570,7 @@ class SecurityPipeline:
             scope_guard = ScopeGuard(
                 secret_key=scope_secret_key,
                 keyring=scope_keyring,
+                audience=scope_audience,
                 resilience=self._resilience,
                 nonce_store=state_backend.nonce_store if state_backend is not None else None,
                 # An authenticated deployment gets subject-bound tokens by
@@ -568,6 +618,7 @@ class SecurityPipeline:
         # other, and both default on.
         self.scan_output_for_exfil = scan_output_for_exfil
         self.scan_tool_call_arguments = scan_tool_call_arguments
+        self.scan_tool_results = scan_tool_results
 
         # Shadow mode: everything is scanned, logged and scored, nothing is
         # blocked or rewritten. The point is to calibrate thresholds against
@@ -615,7 +666,12 @@ class SecurityPipeline:
         # plug in OCR or a vision model via MediaScanner(extractors=[...])
         # to cover text rendered as pixels. See media_guard.py for why no
         # OCR engine is bundled.
-        self.media_scanner = media_scanner or MediaScanner(sanitizer=self.sanitizer)
+        # Same threshold as every other input surface. A media payload was
+        # previously judged against the scanner's own default regardless of
+        # what the pipeline was configured with.
+        self.media_scanner = media_scanner or MediaScanner(
+            sanitizer=self.sanitizer, threshold=input_risk_threshold,
+        )
 
         if audit_logger is None:
             # Default to the Redis Streams audit logger only when the
@@ -667,6 +723,7 @@ class SecurityPipeline:
             "detectors": {r.name: r.mode for r in self.detectors.registrations},
             "failure_policy": {op: self.failure_policy.decision_for(op) for op in OPERATIONS},
             "signing_key_ids": list(self.scope_guard.keyring.key_ids),
+            "audience": self.scope_guard.audience,
             "active_key_id": self.scope_guard.active_key_id,
             "metrics": self.metrics.enabled,
         }
@@ -706,6 +763,31 @@ class SecurityPipeline:
         caller's job and there is no way for this to do it for them.
         """
         return GuardedStream(self, source, holdback_chars=holdback_chars)
+
+    async def _scan_tool_result(
+        self, action: str, output: object, session_id: str | None, principal: str | None,
+    ) -> None:
+        text = "\n".join(t for t in _strings_in(output) if t.strip())
+        if not text:
+            return
+        # The same path a RAG chunk takes: lexical scan, detectors, audit,
+        # metrics, and the session charged if there is one — a tool ran
+        # because the user asked for it, so its result is theirs.
+        scan = await self.pre_process_external(
+            text, source_id=f"tool:{action}", session_id=session_id, principal=principal,
+        )
+        if scan.blocked:
+            self.metrics.increment(
+                "blocks_total" if self.enforcement == "enforce" else "would_block_total",
+                stage="tool_result", reason="risk_score",
+            )
+            await self._audit("tool_result", {
+                "session_id": session_id, "principal": principal, "action": action,
+                "risk_score": scan.risk_score, "matched_patterns": scan.matched_patterns,
+                "blocked": self.enforcement == "enforce", "would_block": True,
+            })
+            if self.enforcement == "enforce":
+                raise ToolResultBlocked(action, scan, output)
 
     # -- Degradation reporting --------------------------------------------
 
@@ -1434,9 +1516,24 @@ class SecurityPipeline:
         self._require_principal(principal, "pre_process_media")
         actor_id = actor_id or principal
         result = await self.media_scanner.scan(payload, media_type=media_type, source_id=source_id)
-        if session_id is not None and result.risk_score > 0:
+
+        # Whatever the extractors recovered is text the model will read, so
+        # it is as much a detector's business as a typed message is — more,
+        # if anything: a document written to be read is paraphrased prose,
+        # which is exactly what the lexical scan misses. One call over the
+        # concatenated extractions, mirroring one call per message.
+        ensemble = None
+        recovered = "\n\n".join(e.text for e in result.extractions if e.text.strip())
+        if self.detectors and recovered:
+            ensemble = await self.detectors.score(recovered)
+            result.detectors = ensemble
+            result.combined_risk_score = self.detectors.combine(result.risk_score, ensemble)
+            result.blocked = result.combined_risk_score >= self.media_scanner.threshold
+
+        if session_id is not None and result.combined_risk_score > 0:
             await self.rate_limiter.record_turn_risk(
-                self.session_key(session_id, principal), result.risk_score, actor_id=actor_id,
+                self.session_key(session_id, principal), result.combined_risk_score,
+                actor_id=actor_id,
             )
         await self._audit("media_scan", {
             "session_id": session_id,
@@ -1446,6 +1543,8 @@ class SecurityPipeline:
             "extractors": [e.extractor for e in result.extractions],
             "extractor_errors": result.extractor_errors,
             "risk_score": result.risk_score,
+            "combined_risk_score": result.combined_risk_score,
+            "detectors": ensemble.as_audit() if ensemble is not None else None,
             "matched_patterns": result.matched_patterns,
             "blocked": result.blocked,
         })
@@ -1477,6 +1576,14 @@ class SecurityPipeline:
         `principal` is presented to the capability token: a token issued
         with a subject can only be spent by that subject, which is what
         makes a leaked token useless to whoever finds it.
+
+        With `scan_tool_results` (the default) the tool's return value is
+        scanned as external content before it is handed back, and raises
+        `ToolResultBlocked` if it looks like an injection: the arguments
+        were checked on the way out, and what comes back is what the model
+        reads next. Callers should still put the result through
+        `wrap_as_data` when building the prompt — that is the structural
+        defence; this is the detection in front of it.
         """
         self._require_principal(principal, "authorized_tool_call")
         if session_id is not None:
@@ -1519,7 +1626,6 @@ class SecurityPipeline:
                 # field rather than a guess.
                 "token_key_id": getattr(token, "key_id", None),
             })
-            return output
         except Exception as exc:
             # The exception TYPE is the reason and is low cardinality; its
             # message is not, and may quote the input, so it stays in the
@@ -1539,3 +1645,10 @@ class SecurityPipeline:
                 "token_key_id": getattr(token, "key_id", None),
             })
             raise
+
+        # Outside the try: the CALL was allowed and is audited as such above.
+        # What is being judged now is the result, which is a different event
+        # with its own audit record, its own metric, and its own exception.
+        if self.scan_tool_results:
+            await self._scan_tool_result(action, output, session_id, principal)
+        return output

@@ -126,17 +126,60 @@ class SessionStore(ABC):
 
 
 class InMemorySessionStore(SessionStore):
-    """Single-process implementation for local development and unit tests."""
+    """Single-process store. Correct only when there is one process.
 
-    def __init__(self):
+    Two things this used to get wrong relative to the shared backends,
+    both invisible in a short test and both real in a process that runs
+    for a week: nothing was ever evicted, so the dictionaries grew with
+    every session id ever seen; and `ttl_seconds` was ignored, so a flag
+    set once was set forever, where every other store lets it expire with
+    the session. Both are now the same as the SQL stores: entries carry an
+    expiry, an expired entry reads as absent, and an opportunistic sweep
+    drops what has expired.
+    """
+
+    def __init__(self, sweep_interval_seconds: float = 60.0):
         self._requests: dict[str, deque[float]] = {}   # session -> event timestamps
         self._tool_calls: dict[str, deque[float]] = {}
-        self._risk: dict[str, tuple[float, float]] = {}      # session -> (value, last_update_ts)
-        self._flagged: set[str] = set()
+        self._windows: dict[str, float] = {}           # key -> window_seconds, for the sweep
+        self._risk: dict[str, tuple[float, float, float]] = {}  # session -> (value, last_update, expires_at)
+        self._flagged: dict[str, float] = {}           # session -> expires_at
+        self._sweep_interval = sweep_interval_seconds
+        self._last_sweep = time.time()
 
-    def _incr(self, store: dict[str, deque[float]], session_id: str, window_seconds: int) -> int:
+    # -- eviction --------------------------------------------------------
+
+    def _sweep(self, now: float) -> None:
+        if now - self._last_sweep < self._sweep_interval:
+            return
+        self._last_sweep = now
+        for store, kind in ((self._requests, "requests"), (self._tool_calls, "tool_calls")):
+            for key in [k for k, events in store.items()
+                        if not events or events[-1] <= now - self._windows.get(f"{kind}:{k}", 0)]:
+                del store[key]
+                self._windows.pop(f"{kind}:{key}", None)
+        for key in [k for k, (_, _, exp) in self._risk.items() if exp <= now]:
+            del self._risk[key]
+        for key in [k for k, exp in self._flagged.items() if exp <= now]:
+            del self._flagged[key]
+
+    def sweep_now(self) -> None:
+        """Force an eviction pass. For tests and for a caller that wants to
+        reclaim memory at a known moment rather than on the next call."""
+        self._last_sweep = 0.0
+        self._sweep(time.time())
+
+    @property
+    def tracked_sessions(self) -> int:
+        return len(set(self._requests) | set(self._tool_calls) | set(self._risk) | set(self._flagged))
+
+    # -- budgets ---------------------------------------------------------
+
+    def _incr(self, store: dict[str, deque[float]], kind: str, session_id: str, window_seconds: int) -> int:
         now = time.time()
+        self._sweep(now)
         events = store.setdefault(session_id, deque())
+        self._windows[f"{kind}:{session_id}"] = window_seconds
         cutoff = now - window_seconds
         while events and events[0] <= cutoff:
             events.popleft()
@@ -144,33 +187,48 @@ class InMemorySessionStore(SessionStore):
         return len(events)
 
     async def increment_requests(self, session_id: str, window_seconds: int) -> int:
-        return self._incr(self._requests, session_id, window_seconds)
+        return self._incr(self._requests, "requests", session_id, window_seconds)
 
     async def increment_tool_calls(self, session_id: str, window_seconds: int) -> int:
-        return self._incr(self._tool_calls, session_id, window_seconds)
+        return self._incr(self._tool_calls, "tool_calls", session_id, window_seconds)
+
+    # -- risk ------------------------------------------------------------
 
     async def add_risk(
         self, session_id: str, risk_delta: float, decay_per_second: float,
         flag_threshold: float, ttl_seconds: int,
     ) -> RiskUpdate:
         now = time.time()
-        current, last_update = self._risk.get(session_id, (0.0, now))
+        self._sweep(now)
+        current, last_update, expires_at = self._risk.get(session_id, (0.0, now, 0.0))
+        if expires_at <= now:
+            current, last_update = 0.0, now   # expired: fresh state, as in the SQL stores
         elapsed = max(0.0, now - last_update)
         decayed = max(0.0, current - elapsed * decay_per_second)
         updated = decayed + risk_delta
-        self._risk[session_id] = (updated, now)
-        if updated >= flag_threshold:
-            self._flagged.add(session_id)
-        return RiskUpdate(updated, session_id in self._flagged)
+        self._risk[session_id] = (updated, now, now + ttl_seconds)
+        # Sticky while the session lives: refreshed to the session's expiry
+        # on every update, gone when the session is.
+        if updated >= flag_threshold or self._is_flagged(session_id, now):
+            self._flagged[session_id] = now + ttl_seconds
+        return RiskUpdate(updated, self._is_flagged(session_id, now))
+
+    def _is_flagged(self, session_id: str, now: float) -> bool:
+        expires_at = self._flagged.get(session_id)
+        return expires_at is not None and expires_at > now
 
     async def is_flagged(self, session_id: str) -> bool:
-        return session_id in self._flagged
+        now = time.time()
+        self._sweep(now)
+        return self._is_flagged(session_id, now)
 
     async def reset_session(self, session_id: str) -> None:
         self._requests.pop(session_id, None)
         self._tool_calls.pop(session_id, None)
+        self._windows.pop(f"requests:{session_id}", None)
+        self._windows.pop(f"tool_calls:{session_id}", None)
         self._risk.pop(session_id, None)
-        self._flagged.discard(session_id)
+        self._flagged.pop(session_id, None)
 
 
 # ---------------------------------------------------------------------------

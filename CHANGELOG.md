@@ -304,6 +304,35 @@ distribution."
   their documented error; streaming equals buffered for any text and any
   chunking.
 
+### Fixed — gaps found reviewing every input surface after the feature work
+
+- **Detectors did not run on media.** `pre_process_media` ran only the
+  lexical scan over extracted text; a paraphrased instruction in a PDF
+  went past the detector meant to catch it. Now scored like a message,
+  with `MediaScanResult.combined_risk_score`/`.detectors`, audited, and
+  the merged score charged to the session. The scanner also now uses the
+  pipeline's `input_risk_threshold` instead of its own default.
+- **Tokens had no audience.** Two services sharing a signing key accepted
+  each other's tokens. `ScopeGuard(audience=...)` puts a signed `aud` in
+  every token and verifies it before the subject; a guard without an
+  audience is unchanged. `SecurityPipeline(scope_audience=)`,
+  `PipelineConfig.audience`, `CapabilityToken.audience`.
+- **Tool results returned to the model unscanned.** `authorized_tool_call`
+  now scans every string in the return value as external content
+  (`source_id="tool:<action>"`, detectors included, session charged) and
+  raises `ToolResultBlocked` — carrying the scan and the raw output — when
+  it trips the threshold. The call is still audited as allowed; the result
+  is a separate `tool_result` event. Shadow mode passes it through with
+  `would_block`. `scan_tool_results=False` disables it.
+- **`InMemorySessionStore` never evicted and ignored `ttl_seconds`.** A
+  long-running single process grew with every session id ever seen, and a
+  flag set once was set forever where every shared store lets it expire.
+  Entries now carry an expiry, expired entries read as absent, an
+  opportunistic sweep (`sweep_interval_seconds`, `sweep_now()`) reclaims
+  them, and `tracked_sessions` reports the footprint.
+- `AUDIT_SCHEMA_VERSION` → 3: new `tool_result` event; `media_scan` gains
+  `combined_risk_score` and `detectors`.
+
 ### Changed — session budget semantics
 
 - **Sliding-window request and tool-call budgets** on every store (in-memory,

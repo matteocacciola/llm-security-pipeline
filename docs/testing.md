@@ -122,7 +122,7 @@ only Redis up still exercises the Redis cases and cleanly skips the
 PostgreSQL/MySQL ones instead of failing.
 
 Every audit event carries `schema_version` (`AUDIT_SCHEMA_VERSION`,
-currently 2); it is bumped whenever a field is added, renamed or changes
+currently 3); it is bumped whenever a field is added, renamed or changes
 meaning, so a consumer can branch on it instead of finding out when its
 parser breaks. The history is in `CHANGELOG.md`.
 

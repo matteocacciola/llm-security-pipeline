@@ -51,6 +51,12 @@ in `pyproject.toml`, as is correct for a library.
 
 ## Do you actually need Redis?
 
+The in-memory stores are correct for one process and evict what has
+expired on an opportunistic sweep, so a single-process deployment does not
+grow without bound; flags expire with the session, as they do on the
+shared backends.
+
+
 Not always. The decision depends on **how many Python processes share the
 limits being enforced**, not on how many machines you have:
 
