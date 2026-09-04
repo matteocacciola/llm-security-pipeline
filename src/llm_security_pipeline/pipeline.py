@@ -73,6 +73,8 @@ different parallelization strategies:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import dataclasses
 import logging
 import functools
@@ -82,6 +84,7 @@ import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from collections.abc import AsyncIterator, Awaitable
 from typing import Callable
 
 from .services import (
@@ -96,16 +99,42 @@ from .services import (
     Sanitizer,
     SanitizationResult,
     ScopeGuard,
+    SigningKeyring,
     OutputGuard,
     OutputScanResult,
     SessionRateLimiter,
     SessionLimits,
     RateLimitExceeded,
 )
+from .services.detectors import (
+    DetectorEnsemble,
+    EnsembleResult,
+    Registration,
+)
+from .services.streaming_guard import (
+    DEFAULT_HOLDBACK_CHARS,
+    StreamDelta,
+    StreamingOutputGuard,
+)
+from .metrics import MetricsSink, SafeMetricsSink
+from .resilience import (
+    AUDIT,
+    Degradation,
+    FailurePolicy,
+    ResilientBackend,
+)
 from .sessions.stores import ProvenanceRecord
+from .state_backend import StateBackend, RedisStateBackend
 
 logger = logging.getLogger(__name__)
-from .state_backend import StateBackend, RedisStateBackend
+
+# Degradations collected for the request currently being handled. A
+# ContextVar rather than an attribute because one SecurityPipeline serves
+# many concurrent requests, and a shared list would hand one caller another
+# caller's failures.
+_current_degradations: contextvars.ContextVar[list[Degradation] | None] = (
+    contextvars.ContextVar("llm_security_pipeline_degradations", default=None)
+)
 
 try:
     from redis.asyncio import Redis
@@ -119,6 +148,21 @@ class PreProcessResult:
     blocked: bool
     would_block: bool = False
     rate_limited: bool = False
+    # What the semantic detectors said, if any are registered. None when
+    # none are. `sanitized.risk_score` stays the LEXICAL score whatever the
+    # detectors report — conflating them would make the audit record
+    # unable to answer "which signal actually fired".
+    detectors: EnsembleResult | None = None
+    # The score the block decision was taken on: the lexical score merged
+    # with the enforcing detectors. Equal to the lexical score when no
+    # detector is enforcing.
+    combined_risk_score: float = 0.0
+    # Guards that could not run because their backend was unreachable, and
+    # were allowed through by the failure policy. Empty on the happy path.
+    # A caller that ignores this is running unguarded without knowing it,
+    # which is the failure mode fail-open exists to make survivable rather
+    # than invisible.
+    degraded: tuple[Degradation, ...] = ()
 
 
 @dataclass
@@ -130,6 +174,7 @@ class PostProcessResult:
     # In shadow mode `blocked` is always False while `would_block` records
     # what enforcement would have done. Equal to `blocked` otherwise.
     would_block: bool = False
+    degraded: tuple[Degradation, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +212,14 @@ class RedisStreamAuditLogger(AuditLogger):
 
     async def log(self, event_type: str, data: dict) -> None:
         payload = {"event": event_type, "data": json.dumps(data, ensure_ascii=False, default=str)}
-        await self._redis.xadd(self._stream_name, payload, maxlen=self._maxlen, approximate=True)
+        # The redis-py stubs type the mapping more narrowly than the server
+        # accepts; both values here are str, which is a valid field value.
+        await self._redis.xadd(
+            self._stream_name,
+            payload,  # type: ignore[arg-type]
+            maxlen=self._maxlen,
+            approximate=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +249,144 @@ def _scan_output(
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+class GuardedStream:
+    """A model token stream with the output guard in front of it.
+
+    Async-iterable rather than an async generator function so the verdict
+    survives the loop: a generator that has finished has nowhere to put
+    "and it was blocked", and a caller who has been forwarding chunks to a
+    user needs exactly that after the loop ends.
+    """
+
+    def __init__(
+        self,
+        pipeline: "SecurityPipeline",
+        source: AsyncIterator[str],
+        holdback_chars: int = DEFAULT_HOLDBACK_CHARS,
+    ):
+        self._pipeline = pipeline
+        self._source = source
+        shadow = pipeline.enforcement == "shadow"
+        self._guard = StreamingOutputGuard(
+            output_guard=pipeline.output_guard,
+            exfil_guard=pipeline.exfil_guard if pipeline.scan_output_for_exfil else None,
+            system_prompt=pipeline.system_prompt,
+            overlap_threshold=pipeline.output_overlap_threshold,
+            # Shadow mode must not change what the user sees, and that
+            # includes when they see it: a hold-back delays every chunk, so
+            # observing a stream would silently make it feel slower than
+            # the stream it is meant to be measuring. Detection is
+            # unaffected — the detection tail is sized independently.
+            holdback_chars=0 if shadow else holdback_chars,
+            redact_pii=not shadow,
+        )
+        self._shadow = shadow
+        self.blocked = False
+        self.would_block = False
+        self.reason: str | None = None
+        self.replacement_text: str | None = None
+        self.leaked_before_holdback = False
+        self._audited = False
+
+    def __aiter__(self) -> "GuardedStream":
+        return self
+
+    async def __anext__(self) -> str:
+        while True:
+            try:
+                chunk = await self._source.__anext__()
+            except StopAsyncIteration:
+                delta = self._guard.finish()
+                self._record(delta)
+                await self._audit_once()
+                if delta.text and not self._is_blocking(delta):
+                    return delta.text
+                raise
+            except BaseException:
+                # The model stream failed. Whatever was scanned still gets
+                # logged, so a truncated response is not an unlogged one.
+                await self._audit_once()
+                raise
+
+            delta = self._guard.feed(chunk)
+            self._record(delta)
+            if self._is_blocking(delta):
+                await self._audit_once()
+                raise StopAsyncIteration
+            # Shadow mode forwards exactly what the model produced.
+            text = chunk if self._shadow else delta.text
+            if text:
+                return text
+
+    def _is_blocking(self, delta: StreamDelta) -> bool:
+        return delta.blocked and not self._shadow
+
+    def _record(self, delta: StreamDelta) -> None:
+        if not delta.blocked:
+            return
+        self.would_block = True
+        self.reason = delta.reason
+        # Meaningless in shadow mode, where the hold-back is off and
+        # everything is emitted by design: it would be True on every
+        # observation and stop distinguishing anything.
+        self.leaked_before_holdback = delta.leaked_before_holdback and not self._shadow
+        if not self._shadow:
+            self.blocked = True
+            self.replacement_text = delta.replacement_text
+
+    async def _audit_once(self) -> None:
+        if self._audited:
+            return
+        self._audited = True
+        scan = self._guard.result()
+        metrics = self._pipeline.metrics
+        metrics.increment(
+            "requests_total",
+            stage="output_stream",
+            outcome="blocked" if self.blocked else "allowed",
+            enforcement=self._pipeline.enforcement,
+        )
+        metrics.observe(
+            "risk_score", scan.system_prompt_overlap_score,
+            stage="output_stream", kind="system_prompt_overlap",
+        )
+        for kind, findings in (
+            ("secret", scan.secret_findings), ("pii", scan.pii_findings),
+        ):
+            for category in findings:
+                metrics.increment(
+                    "findings_total", stage="output_stream", kind=kind, category=category,
+                )
+        if self.blocked:
+            metrics.increment("blocks_total", stage="output_stream", reason=self.reason or "unknown")
+        elif self.would_block:
+            metrics.increment(
+                "would_block_total", stage="output_stream", reason=self.reason or "unknown",
+            )
+        if self.leaked_before_holdback:
+            # Should be zero. A non-zero rate here means holdback_chars is
+            # smaller than something the patterns can match, and part of it
+            # reached a user before it could be recognized.
+            metrics.increment("stream_leaks_total")
+        await self._pipeline._audit("output_scan", {
+            "streamed": True,
+            "secret_categories": list(scan.secret_findings.keys()),
+            "pii_categories": list(scan.pii_findings.keys()),
+            "system_prompt_overlap_score": scan.system_prompt_overlap_score,
+            "blocked": self.blocked,
+            "would_block": self.would_block,
+            "reason": self.reason,
+            # Not the same incident as a clean block: part of the match had
+            # already reached the user before it could be recognized.
+            "leaked_before_holdback": self.leaked_before_holdback,
+            "emitted_chars": self._guard.emitted_chars,
+        })
+
+    @property
+    def scan(self) -> OutputScanResult:
+        return self._guard.result()
+
+
 class SecurityPipeline:
     def __init__(
         self,
@@ -204,6 +394,8 @@ class SecurityPipeline:
         input_risk_threshold: float = 0.6,
         output_overlap_threshold: float = 0.35,
         scope_guard: ScopeGuard | None = None,
+        scope_secret_key: bytes | None = None,
+        scope_keyring: SigningKeyring | None = None,
         sanitizer: Sanitizer | None = None,
         output_guard: OutputGuard | None = None,
         exfil_guard: ExfilGuard | None = None,
@@ -214,6 +406,9 @@ class SecurityPipeline:
         media_scanner: MediaScanner | None = None,
         enforcement: str = "enforce",
         session_identity: str | None = None,
+        failure_policy: FailurePolicy | None = None,
+        detectors: "list[Registration] | DetectorEnsemble | None" = None,
+        metrics: MetricsSink | None = None,
         rate_limiter: SessionRateLimiter | None = None,
         audit_logger: AuditLogger | None = None,
         pii_config_path: str | None = None,
@@ -266,8 +461,48 @@ class SecurityPipeline:
             )
         self.session_identity = session_identity or "untrusted"
 
+        if scope_guard is not None and (scope_secret_key is not None or scope_keyring is not None):
+            raise ValueError(
+                "Pass either scope_guard or scope_secret_key/scope_keyring, not both — "
+                "the key belongs to the guard you supplied."
+            )
+        if scope_secret_key is not None and scope_keyring is not None:
+            raise ValueError(
+                "Pass either scope_secret_key or scope_keyring, not both. "
+                "scope_secret_key is shorthand for a one-key keyring; pass a "
+                "SigningKeyring as soon as you need to rotate."
+            )
+        # Aggregate counters, kept deliberately separate from the audit
+        # log: that one is per-request and keeps identifiers, this one is
+        # aggregate and carries none. See metrics.py.
+        self.metrics = SafeMetricsSink(metrics)
+
+        # One ResilientBackend shared by every guard, so the circuit
+        # breakers and the degradation reporting see a single coherent
+        # picture instead of each guard forming its own opinion about
+        # whether the backend is up.
+        self._resilience = ResilientBackend(failure_policy).with_callback(self._on_degraded)
+        self.failure_policy = self._resilience.policy
+
         if scope_guard is None:
+            # Without an explicit key the guard generates a private one per
+            # process, which means tokens issued here verify nowhere else.
+            # ScopeGuard warns about that itself; the warning is escalated
+            # here because a state_backend is proof that more than one
+            # process is expected to share this state.
+            if scope_secret_key is None and scope_keyring is None and state_backend is not None:
+                logger.warning(
+                    "SecurityPipeline: a state_backend was configured (so this "
+                    "deployment expects several processes to share state) but no "
+                    "signing key was given. Capability tokens will be signed "
+                    "with a key private to this process and will fail verification "
+                    "on every other one. Pass scope_secret_key= (or scope_keyring=) "
+                    "from your secret manager, the same value in every process."
+                )
             scope_guard = ScopeGuard(
+                secret_key=scope_secret_key,
+                keyring=scope_keyring,
+                resilience=self._resilience,
                 nonce_store=state_backend.nonce_store if state_backend is not None else None,
                 # An authenticated deployment gets subject-bound tokens by
                 # default: a token that names nobody is spendable by anyone
@@ -280,6 +515,7 @@ class SecurityPipeline:
             rate_limiter = SessionRateLimiter(
                 limits=session_limits,
                 store=state_backend.session_store if state_backend is not None else None,
+                resilience=self._resilience,
             )
         self.rate_limiter = rate_limiter
 
@@ -321,9 +557,33 @@ class SecurityPipeline:
         # Ingest-time scanning. The guard works without a provenance store;
         # only record/verify need one, and it comes from the state backend
         # when that backend provides it.
+        if isinstance(detectors, DetectorEnsemble):
+            self.detectors = detectors
+            self._adopt_reporting(detectors)
+        else:
+            self.detectors = DetectorEnsemble(detectors, resilience=self._resilience)
+        if self.detectors and not self.detectors.enforcing:
+            logger.info(
+                "SecurityPipeline: %d semantic detector(s) registered, none enforcing. "
+                "They will be scored and audited without changing any decision. "
+                "Measure them on your own traffic (llm_security_pipeline.evaluation), "
+                "then re-register with mode='enforcing'.",
+                len(self.detectors.registrations),
+            )
+
+        # A guard supplied by the caller brought its own ResilientBackend,
+        # and therefore its own policy — which is theirs to choose and is
+        # left alone. What is adopted is the reporting: without this, a
+        # degraded check on a caller-supplied rate limiter would reach the
+        # log and never the caller, and "fail-open is never silent" would
+        # quietly stop being true for anyone who configured their limits the
+        # documented way.
+        self._adopt_reporting(scope_guard, rate_limiter)
+
         self.ingest_guard = ingest_guard or IngestGuard(
             sanitizer=self.sanitizer,
             exfil_guard=self.exfil_guard,
+            resilience=self._resilience,
             provenance_store=getattr(state_backend, "provenance_store", None),
         )
 
@@ -349,6 +609,83 @@ class SecurityPipeline:
         self.process_executor = process_executor or ProcessPoolExecutor(max_workers=os.cpu_count() or 4)
         self.external_scan_parallel_min_chunks = external_scan_parallel_min_chunks
         self.large_input_offload_threshold_chars = large_input_offload_threshold_chars
+
+    # -- Streaming output -------------------------------------------------
+
+    def guard_stream(
+        self,
+        source: "AsyncIterator[str]",
+        holdback_chars: int = DEFAULT_HOLDBACK_CHARS,
+    ) -> "GuardedStream":
+        """Wrap a token stream so it is scanned while it is still arriving.
+
+            guarded = pipeline.guard_stream(model_stream)
+            async for chunk in guarded:
+                await websocket.send(chunk)
+            if guarded.blocked:
+                await websocket.replace(guarded.replacement_text)
+
+        The iteration ends silently on a block rather than yielding the
+        refusal as a final chunk, because appending it would leave the
+        offending text above it on screen. Replacing the message is the
+        caller's job and there is no way for this to do it for them.
+        """
+        return GuardedStream(self, source, holdback_chars=holdback_chars)
+
+    # -- Degradation reporting --------------------------------------------
+
+    def _adopt_reporting(self, *guards: object) -> None:
+        """Point a guard's degradation callback at this pipeline.
+
+        Only the callback: the guard's own FailurePolicy is untouched. If
+        the same guard instance is shared between two pipelines the later
+        one wins, which is the price of guards being independently usable.
+        """
+        for guard in guards:
+            backend = getattr(guard, "_resilience", None) or getattr(guard, "resilience", None)
+            if isinstance(backend, ResilientBackend) and backend is not self._resilience:
+                backend.with_callback(self._on_degraded)
+
+    async def _on_degraded(self, event: Degradation) -> None:
+        """Called by ResilientBackend whenever a guard did not run.
+
+        Two destinations, on purpose. The audit event is for whoever reads
+        the logs afterwards; the per-call bucket is for the caller handling
+        this request right now, who is the only one in a position to decide
+        whether to serve a reply that was not fully checked.
+        """
+        bucket = _current_degradations.get()
+        if bucket is not None:
+            bucket.append(event)
+        self.metrics.increment(
+            "degradations_total", operation=event.operation, decision=event.decision,
+        )
+        if event.operation == AUDIT:
+            # The audit logger is what just failed. ResilientBackend has
+            # already emitted a warning through `logging`; trying to record
+            # the failure through the thing that failed would recurse.
+            return
+        await self._audit("backend_degraded", event.as_dict())
+
+    @contextlib.contextmanager
+    def _collecting_degradations(self):
+        """Per-call bucket, held in a ContextVar so concurrent requests
+        sharing one pipeline don't collect each other's failures."""
+        bucket: list[Degradation] = []
+        token = _current_degradations.set(bucket)
+        try:
+            yield bucket
+        finally:
+            _current_degradations.reset(token)
+
+    async def _audit(self, event_type: str, data: dict) -> None:
+        """Write an audit event under the failure policy.
+
+        Defaults to open: losing a log line should not refuse the request
+        the line was describing. Set `FailurePolicy(audit="closed")` if your
+        compliance position is that an unlogged request must not happen.
+        """
+        await self._resilience.run(AUDIT, lambda: self.audit.log(event_type, data))
 
     # -- Lifecycle -----------------------------------------------------
 
@@ -407,12 +744,94 @@ class SecurityPipeline:
         address — against which risk accumulates even when sessions rotate.
         It defaults to the principal when one is given.
         """
+        with self._collecting_degradations() as degraded:
+            with self.metrics.timed("scan_duration_seconds", stage="input"):
+                try:
+                    result = await self._pre_process(
+                        user_input, session_id=session_id, principal=principal,
+                        actor_id=actor_id, degraded=degraded,
+                    )
+                except RateLimitExceeded:
+                    # Under enforcement this leaves as an exception, so it
+                    # would otherwise never reach the counters and the
+                    # requests_total series would silently under-count the
+                    # traffic it claims to describe.
+                    self.metrics.increment(
+                        "requests_total", stage="input", outcome="rate_limited",
+                        enforcement=self.enforcement,
+                    )
+                    self.metrics.increment("rate_limited_total", stage="input")
+                    self.metrics.increment(
+                        "blocks_total", stage="input", reason="rate_limit",
+                    )
+                    raise
+        self._record_input_metrics(result)
+        return result
+
+    def _record_input_metrics(self, result: PreProcessResult) -> None:
+        metrics = self.metrics
+        metrics.increment(
+            "requests_total",
+            stage="input",
+            outcome="blocked" if result.blocked else "allowed",
+            enforcement=self.enforcement,
+        )
+        # Both scores, labelled: choosing a threshold against the merged
+        # score when the lexical one is what you are tuning is a good way
+        # to pick the wrong number.
+        metrics.observe("risk_score", result.sanitized.risk_score, stage="input", kind="lexical")
+        metrics.observe("risk_score", result.combined_risk_score, stage="input", kind="combined")
+        for pattern in result.sanitized.matched_patterns:
+            metrics.increment("findings_total", stage="input", kind="pattern", category=pattern)
+        if result.rate_limited:
+            metrics.increment("rate_limited_total", stage="input")
+        if result.blocked:
+            metrics.increment("blocks_total", stage="input", reason=self._input_reason(result))
+        elif result.would_block:
+            # The shadow-mode number: what enforcement would have done.
+            # Comparing the two series is the whole point of shadow mode.
+            metrics.increment(
+                "would_block_total", stage="input", reason=self._input_reason(result),
+            )
+        if result.detectors is not None:
+            for detector in result.detectors.results:
+                mode = "enforcing" if detector.detector in self.detectors.enforcing else "advisory"
+                metrics.observe(
+                    "detector_score", detector.score, detector=detector.detector, mode=mode,
+                )
+            for name in result.detectors.errors:
+                metrics.increment("detector_errors_total", detector=name)
+
+    def _input_reason(self, result: PreProcessResult) -> str:
+        """Which signal decided. Low cardinality by construction: four
+        possible values, so it is safe as a metric label."""
+        if result.rate_limited:
+            return "rate_limit"
+        if result.sanitized.oversized:
+            return "oversized"
+        if result.combined_risk_score >= self.input_risk_threshold:
+            return "risk_score"
+        # Nothing about this turn on its own; the session accumulated it.
+        return "session_risk"
+
+    async def _pre_process(
+        self,
+        user_input: str,
+        session_id: str | None,
+        principal: str | None,
+        actor_id: str | None,
+        degraded: list[Degradation],
+    ) -> PreProcessResult:
         self._require_principal(principal, "pre_process")
         actor_id = actor_id or principal
         scoped_session = (
             self.session_key(session_id, principal) if session_id is not None else None
         )
         loop = asyncio.get_running_loop()
+
+        # Either an executor Future or a plain coroutine, depending on the
+        # branch below; the only thing the caller does with it is await it.
+        scan_awaitable: Awaitable[SanitizationResult]
 
         # The scan itself is fast for typical chat-message sizes, so it's
         # run inline by default (see module docstring for why offloading a
@@ -429,7 +848,7 @@ class SecurityPipeline:
                 session_id and f"user_message:{session_id}",
             )
         else:
-            async def _inline_scan():
+            async def _inline_scan() -> SanitizationResult:
                 return self.sanitizer.scan_text(
                     user_input,
                     threshold=self.input_risk_threshold,
@@ -437,6 +856,15 @@ class SecurityPipeline:
                     source_id=session_id and f"user_message:{session_id}",
                 )
             scan_awaitable = _inline_scan()
+
+        # A network-backed judge adds its full latency to every turn if it
+        # is awaited in sequence, so it starts now and is collected after
+        # the lexical scan rather than before it.
+        detector_task = (
+            asyncio.ensure_future(self.detectors.score(user_input))
+            if self.detectors
+            else None
+        )
 
         # Redis budget check is independent I/O: run it concurrently with
         # the scan rather than sequentially after it.
@@ -446,14 +874,14 @@ class SecurityPipeline:
                 # The counter still has to be incremented — a shadow
                 # deployment that does not count is not measuring the same
                 # system — but going over budget is recorded, not raised.
-                results = await asyncio.gather(
+                scan_outcome, limit_outcome = await asyncio.gather(
                     scan_awaitable,
                     self.rate_limiter.check_request(scoped_session),
                     return_exceptions=True,
                 )
-                result, limit_outcome = results
-                if isinstance(result, BaseException):
-                    raise result
+                if isinstance(scan_outcome, BaseException):
+                    raise scan_outcome
+                result = scan_outcome
                 rate_limited = isinstance(limit_outcome, RateLimitExceeded)
                 if isinstance(limit_outcome, BaseException) and not rate_limited:
                     raise limit_outcome
@@ -464,69 +892,181 @@ class SecurityPipeline:
         else:
             result = await scan_awaitable
 
+        ensemble = await detector_task if detector_task is not None else None
+        combined_risk = (
+            self.detectors.combine(result.risk_score, ensemble)
+            if ensemble is not None
+            else result.risk_score
+        )
+        # Recomputed rather than trusting `result.blocked`: the sanitizer
+        # only saw the lexical half of the evidence.
+        detector_blocked = combined_risk >= self.input_risk_threshold
+
         cumulative = None
         session_flagged = False
         if scoped_session is not None:
             cumulative = await self.rate_limiter.record_turn_risk(
-                scoped_session, result.risk_score, actor_id=actor_id,
+                scoped_session, combined_risk, actor_id=actor_id,
             )
             session_flagged = await self.rate_limiter.is_session_flagged(
                 scoped_session, actor_id=actor_id,
             )
 
-        await self.audit.log("input_scan", {
+        await self._audit("input_scan", {
             "session_id": session_id,
             "principal": principal,
             "actor_id": actor_id,
             "enforcement": self.enforcement,
             "risk_score": result.risk_score,
+            "combined_risk_score": combined_risk,
+            "detectors": ensemble.as_audit() if ensemble is not None else None,
             "cumulative_session_risk": cumulative,
             "session_flagged": session_flagged,
             "matched_patterns": result.matched_patterns,
             "matched_languages": list(result.matched_languages),
             "decoded_payload_hits": bool(result.decoded_payload_hits),
             "blocked": result.blocked,
+            "degraded": [d.operation for d in degraded],
         })
 
         # A session flagged for cumulative, gradually-escalating risk is
         # blocked even if this specific turn looked fine on its own — this
         # is what catches multi-turn jailbreak build-up.
-        would_block = result.blocked or session_flagged or rate_limited
+        would_block = detector_blocked or session_flagged or rate_limited
         return PreProcessResult(
             sanitized=result,
             blocked=would_block if self.enforcement == "enforce" else False,
             would_block=would_block,
             rate_limited=rate_limited,
+            detectors=ensemble,
+            combined_risk_score=combined_risk,
+            degraded=tuple(degraded),
         )
 
     # -- External / retrieved content (indirect prompt injection) ----------
 
     async def pre_process_external(
-        self, content: str, source_id: str, threshold: float | None = None,
+        self,
+        content: str,
+        source_id: str,
+        threshold: float | None = None,
+        session_id: str | None = None,
+        principal: str | None = None,
+        actor_id: str | None = None,
     ) -> SanitizationResult:
         """Scan a single piece of content the agent did NOT receive
         directly from the user — a web page, a RAG chunk, a tool output.
         This is the indirect-injection surface. For scanning several
         chunks at once, prefer pre_process_external_batch, which actually
-        parallelizes across CPU cores."""
+        parallelizes across CPU cores.
+
+        Passing `session_id` feeds the resulting risk into that session's
+        cumulative total, the way pre_process and pre_process_media do. It
+        is opt-in rather than automatic because the two readings are both
+        defensible and the caller is the one who knows which applies: a
+        poisoned page the user never chose is not evidence about the user,
+        while a user steering retrieval at a document they planted is.
+        Leaving it off keeps the previous behaviour, where external content
+        is scanned and audited but never charged to anyone.
+        """
+        effective_threshold = threshold if threshold is not None else self.input_risk_threshold
+        detector_task = (
+            asyncio.ensure_future(self.detectors.score(content)) if self.detectors else None
+        )
         result = self.sanitizer.scan_text(
             content,
-            threshold=threshold if threshold is not None else self.input_risk_threshold,
+            threshold=effective_threshold,
             tag="EXTERNAL_CONTENT",
             source_id=source_id,
         )
-        await self.audit.log("external_content_scan", {
+        # Indirect injection is where a semantic detector earns its keep:
+        # a poisoned document is written to be read, so it is paraphrased
+        # prose rather than a phrase from a list.
+        ensemble = await detector_task if detector_task is not None else None
+        if ensemble is not None:
+            result = self._merge_detectors(result, ensemble, effective_threshold)
+
+        self.metrics.increment(
+            "requests_total",
+            stage="external",
+            outcome="blocked" if result.blocked else "allowed",
+            enforcement=self.enforcement,
+        )
+        self.metrics.observe("risk_score", result.risk_score, stage="external", kind="combined")
+        for pattern in result.matched_patterns:
+            self.metrics.increment(
+                "findings_total", stage="external", kind="pattern", category=pattern,
+            )
+        if result.blocked:
+            self.metrics.increment("blocks_total", stage="external", reason="risk_score")
+
+        await self._audit("external_content_scan", {
             "source_id": source_id,
             "risk_score": result.risk_score,
+            "detectors": ensemble.as_audit() if ensemble is not None else None,
             "matched_patterns": result.matched_patterns,
             "matched_languages": list(result.matched_languages),
             "decoded_payload_hits": bool(result.decoded_payload_hits),
             "blocked": result.blocked,
         })
+        await self._record_external_risk(
+            [result], session_id=session_id, principal=principal, actor_id=actor_id,
+        )
         return result
 
+    def _merge_detectors(
+        self,
+        result: SanitizationResult,
+        ensemble: EnsembleResult,
+        threshold: float,
+    ) -> SanitizationResult:
+        """Fold enforcing detector scores into an external-content verdict.
+
+        External content has no PreProcessResult to carry the two scores
+        separately, so here the merged score does replace the lexical one —
+        and `detector:<name>` is appended to `matched_patterns` so the
+        record still says which signal fired. The full breakdown is in the
+        audit event either way.
+        """
+        combined = self.detectors.combine(result.risk_score, ensemble)
+        if combined == result.risk_score:
+            return result
+        labels = [f"detector:{r.detector}" for r in ensemble.results]
+        return dataclasses.replace(
+            result,
+            risk_score=combined,
+            matched_patterns=[*result.matched_patterns, *labels],
+            blocked=combined >= threshold,
+        )
+
+    async def _record_external_risk(
+        self,
+        results: list[SanitizationResult],
+        session_id: str | None,
+        principal: str | None,
+        actor_id: str | None,
+    ) -> None:
+        """Charge external-content risk to a session, when the caller asked
+        for it. The highest-scoring chunk is charged rather than the sum, so
+        a wide retrieval doesn't flag a session for being wide."""
+        if session_id is None:
+            return
+        worst = max((r.risk_score for r in results), default=0.0)
+        if worst <= 0:
+            return
+        await self.rate_limiter.record_turn_risk(
+            self.session_key(session_id, principal),
+            worst,
+            actor_id=actor_id or principal,
+        )
+
     async def pre_process_external_batch(
-        self, chunks: list[tuple[str, str]], threshold: float | None = None,
+        self,
+        chunks: list[tuple[str, str]],
+        threshold: float | None = None,
+        session_id: str | None = None,
+        principal: str | None = None,
+        actor_id: str | None = None,
     ) -> list[SanitizationResult]:
         """Scan multiple retrieved chunks (e.g. several RAG search results,
         or several pages fetched by a browsing agent). This is the actual
@@ -563,7 +1103,7 @@ class SecurityPipeline:
 
         # Audit log writes are independent I/O: fire them concurrently.
         await asyncio.gather(*[
-            self.audit.log("external_content_scan", {
+            self._audit("external_content_scan", {
                 "source_id": result.source_id,
                 "risk_score": result.risk_score,
                 "matched_patterns": result.matched_patterns,
@@ -574,11 +1114,59 @@ class SecurityPipeline:
             for result in results
         ])
 
+        await self._record_external_risk(
+            list(results), session_id=session_id, principal=principal, actor_id=actor_id,
+        )
+
         return list(results)
 
     # -- Output ---------------------------------------------------------
 
     async def post_process(self, model_output: str) -> PostProcessResult:
+        with self._collecting_degradations() as degraded:
+            with self.metrics.timed("scan_duration_seconds", stage="output"):
+                result = await self._post_process(model_output)
+        result = dataclasses.replace(result, degraded=tuple(degraded))
+        self._record_output_metrics(result, streamed=False)
+        return result
+
+    def _record_output_metrics(self, result: PostProcessResult, streamed: bool) -> None:
+        metrics = self.metrics
+        stage = "output_stream" if streamed else "output"
+        metrics.increment(
+            "requests_total",
+            stage=stage,
+            outcome="blocked" if result.blocked else "allowed",
+            enforcement=self.enforcement,
+        )
+        metrics.observe(
+            "risk_score", result.scan.system_prompt_overlap_score,
+            stage=stage, kind="system_prompt_overlap",
+        )
+        for kind, findings in (
+            ("secret", result.scan.secret_findings), ("pii", result.scan.pii_findings),
+        ):
+            for category in findings:
+                metrics.increment("findings_total", stage=stage, kind=kind, category=category)
+        reason = self._output_reason(result)
+        if result.blocked:
+            metrics.increment("blocks_total", stage=stage, reason=reason)
+        elif result.would_block:
+            metrics.increment("would_block_total", stage=stage, reason=reason)
+
+    @staticmethod
+    def _output_reason(result: PostProcessResult) -> str:
+        if result.scan.oversized:
+            return "oversized"
+        if result.scan.secret_findings:
+            return "secret"
+        if result.exfil is not None and result.exfil.blocked:
+            return "exfil"
+        if result.scan.system_prompt_overlap_score > 0:
+            return "system_prompt_overlap"
+        return "none"
+
+    async def _post_process(self, model_output: str) -> PostProcessResult:
         loop = asyncio.get_running_loop()
         # Both scans are pure CPU (regex); offload only if the text is large
         # enough for that to matter (same rationale as pre_process). They go
@@ -605,7 +1193,8 @@ class SecurityPipeline:
             )
         blocked = result.blocked or (exfil is not None and exfil.blocked)
 
-        await self.audit.log("output_scan", {
+        await self._audit("output_scan", {
+            "oversized": result.oversized,
             "secret_categories": list(result.secret_findings.keys()),
             "pii_categories": list(result.pii_findings.keys()),
             "system_prompt_overlap_score": result.system_prompt_overlap_score,
@@ -628,6 +1217,11 @@ class SecurityPipeline:
             "[Response blocked by the security layer: possible credential "
             "or system-prompt leak detected.]"
         )
+        if result.oversized:
+            # Never scanned, so nothing is known about it. Withheld rather
+            # than passed through, because "too big to check" and "checked
+            # and clean" must not produce the same reply.
+            safe_text = result.redacted_text
         if not blocked:
             # Neutralized, not merely redacted: any click-required link with
             # a payload shape has had its destination stripped even though
@@ -659,7 +1253,7 @@ class SecurityPipeline:
         verdict = await self.ingest_guard.ingest(
             content, document_id=document_id, source_id=source_id, trust=trust,
         )
-        await self.audit.log("ingest", {
+        await self._audit("ingest", {
             "document_id": verdict.document_id,
             "source_id": verdict.source_id,
             "trust": verdict.trust,
@@ -691,11 +1285,16 @@ class SecurityPipeline:
                 for content, document_id, source_id in documents
             ]
         else:
-            # The guard sent to the worker processes is a copy without the
-            # provenance store: that store owns a connection, which is not
-            # picklable and has no business being duplicated per worker.
-            # Recording stays in this process, where the connection lives.
-            scanner = dataclasses.replace(self.ingest_guard, provenance_store=None)
+            # The guard sent to the worker processes is a copy stripped of
+            # everything that talks to a backend: the provenance store owns
+            # a connection, and the ResilientBackend holds a callback bound
+            # to this pipeline, so neither is picklable and neither has any
+            # business being duplicated per worker. `evaluate` is pure and
+            # needs neither. Recording and failure handling stay in this
+            # process, where the connection and the breakers live.
+            scanner = dataclasses.replace(
+                self.ingest_guard, provenance_store=None, resilience=None, failure_policy=None,
+            )
             verdicts = await asyncio.gather(*[
                 loop.run_in_executor(
                     self.process_executor,
@@ -717,7 +1316,7 @@ class SecurityPipeline:
                 for v in verdicts
             ])
         await asyncio.gather(*[
-            self.audit.log("ingest", {
+            self._audit("ingest", {
                 "document_id": v.document_id, "source_id": v.source_id,
                 "trust": v.trust, "decision": v.decision,
                 "risk_score": v.risk_score, "reasons": list(v.reasons),
@@ -732,7 +1331,7 @@ class SecurityPipeline:
         no amount of scanning at ingest time can."""
         verdict = await self.ingest_guard.verify_retrieved(content, document_id=document_id)
         if not verdict.trusted:
-            await self.audit.log("retrieval_provenance", {
+            await self._audit("retrieval_provenance", {
                 "document_id": document_id, "reason": verdict.reason,
                 "tampered": verdict.tampered,
             })
@@ -763,7 +1362,7 @@ class SecurityPipeline:
             await self.rate_limiter.record_turn_risk(
                 self.session_key(session_id, principal), result.risk_score, actor_id=actor_id,
             )
-        await self.audit.log("media_scan", {
+        await self._audit("media_scan", {
             "session_id": session_id,
             "principal": principal,
             "source_id": source_id,
@@ -812,14 +1411,14 @@ class SecurityPipeline:
             # problem: `http_get` may be perfectly authorized.
             findings = self.exfil_guard.scan_values([args, kwargs])
             if findings and self.enforcement == "shadow":
-                await self.audit.log("tool_call", {
+                await self._audit("tool_call", {
                     "session_id": session_id, "principal": principal,
                     "action": action, "status": "would_deny",
                     "reason": "exfiltration_in_arguments",
                     "exfil_reasons": sorted({r for f in findings for r in f.reasons}),
                 })
             elif findings:
-                await self.audit.log("tool_call", {
+                await self._audit("tool_call", {
                     "session_id": session_id, "principal": principal,
                     "action": action, "status": "denied",
                     "reason": "exfiltration_in_arguments",
@@ -830,14 +1429,37 @@ class SecurityPipeline:
             output = await self.scope_guard.guarded_call(
                 token, action, func, *args, subject=principal, **kwargs,
             )
-            await self.audit.log("tool_call", {
+            self.metrics.increment(
+                "requests_total", stage="tool_call", outcome="allowed",
+                enforcement=self.enforcement,
+            )
+            await self._audit("tool_call", {
                 "session_id": session_id, "principal": principal,
                 "action": action, "status": "allowed",
+                # Which signing key this token was issued under. This is how
+                # a rotation is finished safely: the old key can be retired
+                # once no spent token has named it for longer than the
+                # longest TTL you issue, and that is a query against this
+                # field rather than a guess.
+                "token_key_id": getattr(token, "key_id", None),
             })
             return output
         except Exception as exc:
-            await self.audit.log("tool_call", {
+            # The exception TYPE is the reason and is low cardinality; its
+            # message is not, and may quote the input, so it stays in the
+            # audit log where identifiers already live.
+            self.metrics.increment(
+                "requests_total", stage="tool_call", outcome="denied",
+                enforcement=self.enforcement,
+            )
+            self.metrics.increment(
+                "blocks_total", stage="tool_call", reason=type(exc).__name__,
+            )
+            if isinstance(exc, RateLimitExceeded):
+                self.metrics.increment("rate_limited_total", stage="tool_call")
+            await self._audit("tool_call", {
                 "session_id": session_id, "principal": principal,
                 "action": action, "status": "denied", "reason": str(exc),
+                "token_key_id": getattr(token, "key_id", None),
             })
             raise

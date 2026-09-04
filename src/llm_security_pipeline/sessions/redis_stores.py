@@ -201,7 +201,12 @@ class RedisProvenanceStore(ProvenanceStore):
         return f"{self._key_prefix}{document_id}"
 
     async def record(self, record: ProvenanceRecord) -> None:
-        await self._redis.hset(self._key(record.document_id), mapping=record.to_dict())
+        # to_dict() is dict[str, str] throughout; the redis-py stubs spell
+        # the accepted mapping type more narrowly than the server does.
+        await self._redis.hset(
+            self._key(record.document_id),
+            mapping=record.to_dict(),  # type: ignore[arg-type]
+        )
 
     async def get(self, document_id: str) -> ProvenanceRecord | None:
         data = await self._redis.hgetall(self._key(document_id))

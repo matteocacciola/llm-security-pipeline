@@ -294,7 +294,9 @@ class MediaScanner:
         outcomes = await asyncio.gather(
             *(run(extractor) for extractor in self.extractors), return_exceptions=True,
         )
-        for extractor, outcome in zip(self.extractors, outcomes):
+        # gather() returns exactly one outcome per extractor; strict=True
+        # makes that an assertion rather than an assumption.
+        for extractor, outcome in zip(self.extractors, outcomes, strict=True):
             name = getattr(extractor, "name", repr(extractor))
             if isinstance(outcome, BaseException):
                 result.extractor_errors[name] = str(outcome)

@@ -10,7 +10,6 @@ along with the knob that changes it.
 
 from __future__ import annotations
 
-import pytest
 
 from llm_security_pipeline import RiskWeights, Sanitizer, SecurityPipeline
 from llm_security_pipeline.evaluation import Evaluator, smoke_corpus

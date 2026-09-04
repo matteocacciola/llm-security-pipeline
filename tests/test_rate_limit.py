@@ -112,7 +112,7 @@ async def _build_backend(backend_name: str):
 async def test_request_budget_enforced_across_processes(backend_name):
     worker = _WORKERS[backend_name]
     session_id = f"test-cross-process-session-{backend_name}"
-    limits_kwargs = dict(window_seconds=60, max_requests_per_window=3)
+    limits_kwargs = {"window_seconds": 60, "max_requests_per_window": 3}
 
     backend = await _build_backend(backend_name)
     await backend.session_store.reset_session(session_id)  # clean slate for repeatable runs

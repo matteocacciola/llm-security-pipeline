@@ -218,6 +218,44 @@ Tests live in `tests/` and run with pytest (`asyncio_mode = "auto"`, see
   `ProcessPoolExecutor`, just the single-process logic they're actually
   meant for (counter increments, window reset, risk decay/flagging,
   session reset).
+- `test_redaction.py` – that a detected secret cannot reach the user.
+  Covers patterns with zero, one and two capture groups (`findall` reports
+  groups rather than whole matches, which used to let every occurrence
+  after the first through unredacted), repeated matches, and findings that
+  overlap each other.
+- `test_metrics.py` – that the numbers a person would act on actually come
+  out (the shadow comparison, both risk scores separately, per-detector
+  distributions), and that the cardinality guard holds: every forbidden
+  label parametrized, and an assertion that the pipeline's own call sites
+  never make the guard fire in the first place.
+- `test_detectors.py` – the socket, not a model: detectors are functions
+  returning a number. Covers advisory-by-default, that max does not become
+  a sum, that a failed detector is excluded rather than scored zero (with
+  an averaging combiner to prove the difference is real), and that a sync
+  detector does not block the event loop.
+- `test_streaming_guard.py` – every case fed at four chunk sizes including
+  one character at a time, because a seam bug shows up at one size and not
+  another. Asserts on what was *emitted* rather than on what was detected,
+  since detection after emission is not a save, and pins the equivalence
+  between a streamed and a buffered response so the choice of transport
+  does not become a security decision.
+- `test_failure_policy.py` – stores that raise and stores that hang, per
+  operation: that the policy is obeyed, that a domain exception is never
+  mistaken for a backend failure, that cancellation is not converted into a
+  security decision, that the breaker stops calling a dead backend and lets
+  one call through after recovery, and above all that no fail-open decision
+  is silent.
+- `test_key_rotation.py` – the three-step rotation walked end to end,
+  asserting that a token issued before each step still verifies after it,
+  plus both ways of getting the order wrong, and that the key id is
+  untrusted input rather than a hint.
+- `test_token_serialization.py` – the `to_str`/`from_str` round trip
+  across two independently constructed guards, malformed and oversized
+  input, an edited payload failing verification, and the warning and error
+  message produced when a guard is using a process-local key.
+- `test_input_limits.py` – the size cap, including that a payload placed
+  past it does not earn a clean verdict, and both branches of charging
+  external-content risk to a session.
 - `test_config_loader.py` – plain unit tests for `PatternRegistry`: default
   loading, override-by-name and add-alongside semantics, and every
   `PatternConfigError` path (malformed JSON, missing file, missing
@@ -252,6 +290,13 @@ each backend once at collection time and skips only the parametrized
 cases for backends that aren't reachable — so, for example, running with
 only Redis up still exercises the Redis cases and cleanly skips the
 PostgreSQL/MySQL ones instead of failing.
+
+Lint and type checking run as their own CI job and are reproducible
+locally with `make lint` (ruff + mypy, both configured in
+`pyproject.toml`). Ruff is deliberately configured as a bug-finding gate
+rather than a formatter: the pyflakes/bugbear/bandit families are on, the
+stylistic ones are not, because a lint job whose output is mostly noise is
+one people learn to skip.
 
 ```bash
 uv sync --extra redis --extra postgres --extra mysql   # drivers used by the test suite
@@ -314,6 +359,15 @@ in-memory stores.
   collapsing every session into one slot. If you applied the manual
   `{session_id}`-in-`key_prefix` workaround this README previously
   suggested, remove it.
+- **Capability-token signing key**: `SecurityPipeline(scope_secret_key=...)`
+  must be the same value in every process. Left unset, `ScopeGuard`
+  generates a random key private to the process it runs in, which is
+  correct for a single-process app and silently wrong for anything else:
+  a token issued on one pod fails verification on every other one, and the
+  error says "possible tampering" about a token nobody tampered with. Both
+  the guard and the pipeline log a warning when this happens, and the
+  signature error explains itself when the key is process-local — but the
+  fix is to pass the key from your secret manager.
 - **Connection reuse**: pass one shared `redis.asyncio.Redis` client (which
   manages its own connection pool) to `RedisStateBackend(redis_client)`
   rather than letting every request open a new connection.
@@ -404,6 +458,17 @@ See the module docstring in `config_loader.py` for the exact schema.
 - Non-text carriers, through pluggable extractors (metadata and embedded
   strings out of the box; OCR is yours to supply)
 
+- Rotating the token signing key without a window in which valid tokens
+  are rejected
+- Measuring all of the above — shadow-mode deltas, score distributions,
+  detector calibration — as aggregate metrics with no identifiers in them
+- Plugging in a model-based detector to cover the paraphrase gap the
+  lexical heuristics leave open, without shipping a model
+- Scanning a response while it streams, without emitting anything that has
+  not been seen whole
+- Deciding, per guard, whether an unreachable state backend means "refuse"
+  or "proceed unchecked" — and making the second one visible when it
+  happens
 - Binding tokens and session state to an authenticated end user, when your
   gateway supplies one, plus risk accumulation that survives session
   rotation when it does not
@@ -473,6 +538,85 @@ guard.check_constraints(token, account_id=requested_account)   # raises on misma
 That answers "does this call match what the token was issued for", which
 is cryptographic and therefore ours. It does not answer "should this user
 be near account 42", which is your data model and stays in your tool.
+
+**Moving a token between services.** `to_str()` serializes a token and
+`CapabilityToken.from_str()` parses it back, which is what makes the
+issue-here/spend-there split possible in the first place:
+
+```python
+token = guard.issue_token(agent_id="bot", scopes=["read_crm"], subject=user_id)
+wire = token.to_str()                       # hand to the caller, queue, header
+
+parsed = CapabilityToken.from_str(wire)     # in the other process
+await guard.authorize(parsed, "read_crm", subject=user_id)
+```
+
+The serialized form is encoded, not encrypted: anyone holding it can read
+the scopes and the subject. What the signature guarantees is that they
+cannot change them. `from_str` raises `ScopeError` for every malformed
+input rather than leaking a `ValueError` or a `JSONDecodeError`, and
+refuses anything over 16 KB before parsing it, since it runs on untrusted
+strings. The signature is verified over the bytes the token arrived as
+rather than over a re-serialization of the parsed payload, so verification
+does not quietly depend on your JSON encoder producing byte-identical
+output to the issuer's.
+
+### Rotating the signing key
+
+A capability token is signed once and verified later, possibly in another
+process, and stays valid for its TTL. With a single key there is no way to
+change it without a window of failures: the instant one process starts
+signing with a new key, every token already in flight becomes "possible
+tampering" everywhere else. That is not a key you can rotate, which means
+in practice it is a key nobody rotates.
+
+So keys are named. `kid` travels inside the signed payload, verification
+looks it up, and a guard holds several keys while signing with exactly one:
+
+```python
+from llm_security_pipeline import SecurityPipeline, SigningKeyring
+
+keyring = SigningKeyring.single(current_key, kid="2026-01")
+pipeline = SecurityPipeline(scope_keyring=keyring)
+```
+
+Rotation is then three deploys and no window:
+
+```python
+keyring = keyring.with_key("2026-02", new_key)   # 1. everyone accepts it
+keyring = keyring.with_active("2026-02")         # 2. now it signs
+keyring = keyring.without_key("2026-01")         # 3. after the longest TTL
+```
+
+**The order is load-bearing, not stylistic.** Promote before step 1 has
+finished rolling out and a token signed by an updated process reaches one
+that has never heard of that key id. Retire before every token naming the
+old key has expired and those tokens stop verifying. Both are the same
+failure the single-key case forces on you, so both raise `UnknownKeyId`
+naming the key rather than a generic signature error — the message
+distinguishes them, and `with_active`/`without_key` refuse locally
+detectable versions of each (promoting a key that is not accepted,
+retiring the active one).
+
+Knowing when step 3 is safe is a question about traffic, not about the
+clock, so `token_key_id` is on every `tool_call` audit event: the old key
+can go once no spent token has named it for longer than the longest TTL you
+issue.
+
+`scope_secret_key=` is still there and is shorthand for
+`SigningKeyring.single(key)` under the id `"default"` — fine until the
+first rotation, at which point that id joins the keyring like any other.
+Keys shorter than 32 bytes are refused rather than documented against, and
+key ids are restricted to `[A-Za-z0-9._:-]` because they end up in JSON
+payloads, error messages and log lines that something else parses.
+
+The `kid` is attacker-controlled before verification, so it is used to
+index a dictionary and nothing else. There is deliberately no
+try-every-key fallback: that would make each verification a search over the
+whole keyring and let a retired key behave like a current one. Editing the
+`kid` breaks the signature, and would not help anyway, since producing a
+signature under the key it was repointed at is the part an attacker cannot
+do.
 
 ### Ingestion-time scanning (`IngestGuard`)
 
@@ -557,6 +701,265 @@ budgets. A failing extractor is recorded in `extractor_errors` and the
 others still run; a scan where everything failed reports 0.0 *with the
 errors attached*, because "nothing was read" and "nothing was there" must
 not look alike.
+
+### Metrics
+
+Three things in this library produce numbers whose entire purpose is to be
+looked at before a decision is taken: shadow mode records what enforcement
+*would* have done, an advisory detector runs so you can see its scores, and
+every threshold is documented as a product decision to be measured rather
+than a fact. All of that lands in the audit stream, which is a log — good
+at "what happened to this request", useless at "what is the distribution of
+risk scores this week and where should the threshold go".
+
+```python
+from prometheus_client import start_http_server
+from llm_security_pipeline import PrometheusMetricsSink, SecurityPipeline
+
+start_http_server(9100)
+pipeline = SecurityPipeline(metrics=PrometheusMetricsSink())
+```
+
+Needs the extra: `pip install "llm-security-pipeline[metrics]"`. Off by
+default — the default sink does nothing. `InMemoryMetricsSink` is there for
+tests and for anyone who wants the numbers without running a Prometheus,
+and `MetricsSink` is a two-method protocol if you have your own.
+
+The series worth building a dashboard on first:
+
+| Metric | What it answers |
+| --- | --- |
+| `would_block_total` vs `blocks_total` | What enforcement would do if you switched shadow mode off. The whole point of shadow mode, and currently the reason people grep logs. |
+| `risk_score{kind}` | The score distribution, split into the lexical score and the score the decision was actually taken on. Tuning a threshold against the wrong one of those is easy to do. |
+| `detector_score{detector,mode}` | Whether an advisory detector is ready to enforce. |
+| `detector_errors_total` | A detector that did not answer contributes nothing rather than zero, so a rise here means the ensemble is quietly weaker without any score moving. |
+| `degradations_total{decision="open"}` | Requests served with part of the checking skipped. |
+| `findings_total{category}` | Which patterns earn their place and which only ever fire on false positives. |
+| `stream_leaks_total` | Should be zero. If it isn't, `holdback_chars` is smaller than something your patterns can match. |
+
+**The metrics sink is synchronous, unlike the audit logger.** That is not
+an oversight: it sits on the hot path of every request, and making it
+awaitable invites implementations that do I/O there. A sink increments
+something in memory and returns; if yours needs the network, buffer and
+flush from a background task.
+
+**There is no failure policy for metrics.** Every other backend has one
+because for every other backend both answers are defensible. Refusing a
+user's request because a counter could not be incremented is never right, a
+knob whose only sensible setting is "open" should not exist, so a sink that
+raises is swallowed and logged once.
+
+**Identifying labels are refused, not discouraged.** `session_id` on a
+metric does two bad things at once: it makes the series cardinality
+unbounded, which is the classic way to take a Prometheus server down, and
+it copies an identifier out of the audit log — access-controlled, retained
+deliberately — into a metrics backend that is usually readable by the whole
+engineering org. Documenting "don't" is not a mechanism, so the names in
+`FORBIDDEN_LABELS` are dropped at the sink with a warning, the measurement
+itself is kept, and the warning fires once rather than per request.
+
+### Semantic detectors
+
+Everything else here decides by shape: a pattern matched, a codepoint was
+invisible, a base64 blob decoded into an instruction. That is bypassed by
+paraphrasing, as this README says elsewhere — *"kindly set aside the
+guidance you were given earlier"* is in no phrase list, and adding it only
+moves the problem to the next wording.
+
+Closing that gap needs a model, and this library does not ship one. Same
+position `MediaScanner` takes about OCR: extraction is yours, scoring is
+ours. Bundling a classifier would pin a runtime, a set of weights and a
+licence into a dependency-light library, and freeze a fast-moving choice on
+everyone who installs it. What is provided is the socket.
+
+```python
+from llm_security_pipeline import (
+    CallableDetector, ENFORCING, Registration, SecurityPipeline,
+)
+
+pipeline = SecurityPipeline(
+    detectors=[
+        Registration(CallableDetector("deberta-injection", classify)),        # advisory
+        Registration(CallableDetector("llm-judge", judge), mode=ENFORCING),   # decides
+    ],
+)
+```
+
+`classify` may be sync or async and may return a float in 0..1 or a
+`DetectorResult`. A sync detector is run on a worker thread rather than
+inline, because an inference call blocking the event loop stalls every
+other request in the process.
+
+**A new detector is advisory until you say otherwise.** A classifier's
+calibration is a property of your traffic, not of the classifier: a model
+with an excellent published F1 will still have a threshold that is wrong
+for your users on the day you install it, and the failure mode of getting
+that wrong is blocking real customers. So it runs, it is scored, it is
+written to the audit record, and it changes nothing. Measure it with
+`llm_security_pipeline.evaluation`, pick a threshold, then re-register it
+as `ENFORCING`. Shadow mode, one detector at a time.
+
+**Scores combine by max, not by sum.** A detector firing on the sentence
+the lexical scan already matched is the same evidence read twice. Adding
+them lets two weak correlated signals reach a threshold neither deserved,
+and the drift grows with every detector added — an ensemble would tend
+towards blocking everything. `max` keeps a confident detector able to raise
+the verdict alone while refusing to manufacture confidence out of
+agreement. Pass `combine=` if your calibration disagrees. `weight` scales a
+detector known to be eager; `threshold` silences the noisy floor many
+classifiers emit on ordinary text, without hiding it from the record.
+
+**A detector that failed contributes nothing, not zero.** Same rule as the
+media scanner: 0.0 means "looked, found nothing", and a detector that timed
+out has not looked. It is recorded in `errors`, surfaced in
+`result.degraded`, and left out of the combination — so a model server
+going down cannot quietly lower every risk score in the system. The
+`detector` failure-policy category defaults to open, because refusing
+traffic when a classifier is unreachable trades a supporting signal for an
+outage.
+
+The lexical score is never overwritten: `sanitized.risk_score` stays what
+the pattern scan found, `combined_risk_score` is what the decision was
+taken on, and both are in the audit event, so the record can still answer
+which signal fired.
+
+### Streaming output
+
+`post_process` needs the finished response. Almost every deployed chat
+surface streams instead, and a guard that only works on a complete response
+is a guard that gets skipped, so the output guard also runs incrementally:
+
+```python
+guarded = pipeline.guard_stream(model_stream)
+async for chunk in guarded:
+    await websocket.send(chunk)
+if guarded.blocked:
+    await websocket.replace(guarded.replacement_text)
+```
+
+It is async-iterable rather than an async generator function because the
+verdict has to survive the loop: a generator that has finished has nowhere
+to put "and it was blocked", which is exactly what a caller who has been
+forwarding chunks needs to know afterwards. The refusal is deliberately not
+yielded as a final chunk — appending it would leave the offending text
+above it on screen. Replacing the message is the caller's job, and nothing
+here can do it for them.
+
+Three problems, and only the first is obvious.
+
+**A secret can straddle a chunk boundary.** `sk-ant-abc` arrives, then
+`def123`; neither half matches alone. So the scan runs over a window — the
+unemitted buffer plus the tail of what was already emitted — not over the
+chunk.
+
+**Emitted text cannot be recalled**, and this shapes everything. The guard
+holds back the most recent `holdback_chars` (256 by default) and releases
+only what lies behind that line, so a pattern that fits inside the
+hold-back is always seen whole *before* any of it is emitted. The cost is
+paid in perceived latency: the user trails the model by a few hundred
+characters. That is the trade, which is why it is a knob.
+
+**A verdict on a prefix is not a verdict.** The system-prompt overlap score
+is a ratio over the whole response; three tokens in it is noise, and acting
+on it would block answers for starting with a word from the system prompt.
+So overlap waits for `min_chars_for_overlap`. A credential match needs no
+such caution — it means the same thing on a prefix as on a whole.
+
+**The limit that cannot be engineered away.** A match longer than the
+hold-back has already had its first characters emitted by the time it is
+recognizable. The guard still detects it, because the detection tail is
+sized independently of the hold-back — deliberately, since tying them
+together would mean lowering the hold-back for latency silently stops
+detecting long credentials rather than reporting a partial leak — and
+reports `leaked_before_holdback=True`, which is a different incident from a
+clean block and is logged as one. Keep `holdback_chars` above the longest
+credential your patterns can match and it does not arise; the default
+clears every pattern shipped with the library.
+
+Shadow mode changes neither content nor timing: the hold-back is switched
+off, chunks are forwarded exactly as they arrive, and `would_block` records
+what enforcement would have done. Observing a stream must not make it feel
+slower than the stream being measured.
+
+### When the backend is down
+
+Every cross-process guarantee here is a round trip to Redis, PostgreSQL or
+MySQL, and those fail: a failover, an exhausted pool, a partition, a
+maintenance window. Until a policy exists, the driver exception simply
+propagates, which makes the decision for you and makes it the same way
+everywhere — the request 500s.
+
+That is a decision, not the absence of one, and it is wrong for some of
+these operations and right for others. So it is named:
+
+```python
+from llm_security_pipeline import FailurePolicy, SecurityPipeline
+
+pipeline = SecurityPipeline(
+    state_backend=backend,
+    failure_policy=FailurePolicy(rate_limit="closed"),  # rather be down than unmetered
+)
+```
+
+**The defaults are asymmetric on purpose**, because the two failure modes
+are not the wrong way round the same amount each time:
+
+| Operation | Default | Why |
+| --- | --- | --- |
+| `token_replay` | `closed` | Without the nonce store there is no `max_uses`, so a single-use token becomes unlimited. Refusing a tool call is bounded and recoverable; an unbounded capability is not. |
+| `provenance` | `closed` | An unverifiable retrieval is exactly the state the store exists to tell apart from a verified one. |
+| `rate_limit` | `open` | The budget mitigates cost and DoS abuse. Refusing all traffic because a counter is unavailable converts a degraded dependency into a total outage — a larger incident than the one being prevented. |
+| `session_risk` | `open` | A heuristic accumulator supporting multi-turn detection. Losing it during an outage loses a supporting signal, not the defence. |
+| `audit` | `open` | A log write that fails should not refuse the request it was describing. Set `closed` if your compliance position is that an unlogged request must not happen. |
+
+`FailurePolicy.all_closed()` and `.all_open()` exist for deployments that
+have made a single decision; `all_open()` warns, because that is a window
+with no replay protection and no provenance verification, and it is the
+window an attacker would pick if they got to pick one.
+
+**Fail-open is only acceptable because it is visible.** A guard that stops
+guarding and says nothing is worse than no guard, for the same reason the
+media scanner refuses to report `0.0` without attaching its extractor
+errors. Every degraded decision goes three places: a `logging` warning, a
+`backend_degraded` audit event, and the result the caller is holding.
+
+```python
+result = await pipeline.pre_process(user_input, session_id=sid, principal=uid)
+if result.degraded:
+    # This reply was produced with some checks not running. Yours to
+    # decide what that is worth — but you get to decide it.
+    metrics.increment("llm_guard.degraded", tags=[d.operation for d in result.degraded])
+```
+
+Under a closed policy the guard raises `BackendUnavailable`, which carries
+the operation and is a **503, not a 403**: the request was not denied on
+its merits, it was never evaluated.
+
+Two things that are easy to leave out and that this handles. A hung backend
+is worse than a dead one, because the failure never arrives and the request
+just waits, so every call is bounded by `timeout_seconds` (2s). And once a
+backend is down, paying that timeout per request turns an availability
+problem into a latency problem for as long as it lasts, so after
+`failure_threshold` consecutive failures a circuit breaker applies the
+policy without calling out at all, retrying once every `recovery_seconds`.
+
+A guard you construct yourself keeps its own policy — that choice is yours
+— but the pipeline adopts its *reporting*, so a degraded check on your own
+`SessionRateLimiter` still reaches you and not just the log.
+
+### Input size
+
+Every scan here is unbounded in the length of its input, so one very large
+paste is a cheap way to occupy a worker. `Sanitizer` and `OutputGuard`
+therefore refuse text over `max_scan_chars` (200,000 by default) instead of
+scanning it, and set `oversized` on the result; `post_process` withholds an
+oversized model response rather than forwarding it.
+
+Refusing rather than truncating is the point. Scanning a prefix and
+reporting the verdict as though it covered the whole text publishes an
+offset past which nothing is inspected, which is a bypass with a documented
+address. A refusal is at least visible to whoever sent it. Pass
+`max_scan_chars=None` to opt out and accept the cost.
 
 ### Tuning the thresholds
 
@@ -720,7 +1123,16 @@ as do the variation selectors used for emoji presentation.
    of view everything looks correct. Use the Redis-backed stores (or wire
    a `StateBackend` into `SecurityPipeline`) for any real
    deployment.
-4. **Phone-number PII detection is intentionally permissive** and produces
+4. **External-content risk is not charged to a session unless you ask.**
+   `pre_process` and `pre_process_media` feed their risk score into the
+   session's cumulative total; `pre_process_external`/`_batch` do so only
+   when given a `session_id`. Both readings are defensible and only you
+   know which applies — a poisoned page the user never chose is not
+   evidence about the user, while a user steering retrieval at a document
+   they planted is. When enabled, the worst chunk in a batch is charged
+   rather than the sum, so a wide retrieval does not flag a session for
+   being wide.
+5. **Phone-number PII detection is intentionally permissive** and produces
    false positives; treat it as a signal to review, not an automatic block.
 
 ## Honest limitations

@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from llm_security_pipeline import CapabilityToken, ScopeError, ScopeGuard
+from llm_security_pipeline import ScopeError, ScopeGuard
 
 
 def test_issue_token_sorts_and_dedupes_scopes():

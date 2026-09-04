@@ -20,6 +20,15 @@ update: ## Update and compile requirements for the local virtual environment.
 check: ## Check requirements for the local virtual environment.
 	@uv sync --check --no-install-project --all-extras
 
+lint: ## Run the lint and type-check gates (same as CI).
+	@uv sync --group dev --all-extras; \
+	uv run ruff check .; \
+	uv run mypy
+
+format: ## Apply ruff's automatic fixes.
+	@uv sync --group dev --all-extras; \
+	uv run ruff check . --fix
+
 test:  ## Run tests.
 	@uv sync --group dev --all-extras; \
 	rm -f .coverage .coverage.*; \

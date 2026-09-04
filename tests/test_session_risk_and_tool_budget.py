@@ -109,7 +109,7 @@ _BACKEND_PARAMS = [
 async def test_tool_call_budget_enforced_across_processes(backend_name):
     worker = _TOOL_CALL_WORKERS[backend_name]
     session_id = f"test-tool-call-budget-{backend_name}"
-    limits_kwargs = dict(window_seconds=60, max_tool_calls_per_window=2)
+    limits_kwargs = {"window_seconds": 60, "max_tool_calls_per_window": 2}
 
     backend = await _build_backend(backend_name)
     await backend.session_store.reset_session(session_id)  # clean slate for repeatable runs

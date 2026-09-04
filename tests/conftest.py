@@ -72,7 +72,7 @@ def _redis_cluster_reachable() -> bool:
         finally:
             try:
                 await client.aclose()
-            except Exception:
+            except Exception:  # noqa: S110 - reachability probe; a failing close tells us nothing
                 pass
 
     return asyncio.run(_ping())

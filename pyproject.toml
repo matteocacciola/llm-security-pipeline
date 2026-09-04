@@ -1,6 +1,6 @@
 [project]
 name = "llm-security-pipeline"
-version = "0.2.0"
+version = "0.3.0"
 description = "Defensive pipeline for LLM apps: prompt injection, tool-call gating, output/PII guards"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -40,12 +40,16 @@ Changelog = "https://github.com/matteocacciola/llm-security-pipeline/releases"
 redis = ["redis>=5.0"]
 images = ["pillow>=10"]
 postgres = ["asyncpg>=0.29"]
+metrics = [
+    "prometheus-client>=0.20",
+]
 mysql = ["aiomysql>=0.2"]
 all = [
     "redis>=5.0",
     "pillow>=10",
     "asyncpg>=0.29",
     "aiomysql>=0.2",
+    "prometheus-client>=0.20",
 ]
 
 [build-system]
@@ -57,6 +61,56 @@ artifacts = ["src/llm_security_pipeline/config/*.json"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/llm_security_pipeline"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Deliberately a bug-finding gate, not a formatting one. Enabling the
+# stylistic families (import sorting, quoted annotations, string
+# modernization) would rewrite most of the tree without catching anything
+# that could actually go wrong at runtime, and a lint job whose output is
+# mostly noise is a lint job people learn to skip.
+#
+#   E4/E7/E9  import and statement errors, syntax errors
+#   F         pyflakes: undefined names, unused imports and variables
+#   B         bugbear: mutable defaults, zip() without strict, etc.
+#   S         bandit: the security rules, which this library should hold
+#             itself to before it holds anyone else to anything
+#   C4        comprehension/collection call simplifications
+#   RUF100    noqa directives that no longer suppress anything
+select = ["E4", "E7", "E9", "F", "B", "S", "C4", "RUF100"]
+
+[tool.ruff.lint.per-file-ignores]
+# S105 matches on the NAME of a variable, not on what it holds. In a
+# library whose domain vocabulary is "secret", it fires on category
+# constants and test fixtures and never on a real credential.
+"src/llm_security_pipeline/config_loader.py" = ["S105"]
+# Same story: S105 fires on the constant named TOKEN_REPLAY.
+"src/llm_security_pipeline/resilience.py" = ["S105"]
+# Tests assert (S101) and carry fixture credentials by construction.
+"tests/*" = ["S101", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src/llm_security_pipeline"]
+# The optional backends (redis, asyncpg, aiomysql, pillow) are extras, so
+# a checkout without them installed must still type-check.
+ignore_missing_imports = true
+# Not strict mode: the goal is to catch None-dereferences and wrong
+# argument types in the guard paths, not to annotate every local. Two real
+# findings came out of turning this on at this level, which is the level
+# that pays for itself.
+# Deliberately off. Whether a `type: ignore` on the optional-backend
+# imports is needed depends on which extras (and which of their stubs) are
+# installed, so this check reports differently in CI, in a redis-only
+# checkout and on a developer's machine. A rule that flags correct code
+# depending on the environment is worse than the ignores it polices.
+warn_unused_ignores = false
+warn_redundant_casts = true
+no_implicit_optional = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -84,10 +138,13 @@ source = ["llm_security_pipeline"]
 
 [dependency-groups]
 dev = [
+    "mypy>=1.13",
+    "prometheus-client>=0.20",
     "pymysql>=1.2.0",
     "pytest>=9.1.0",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
     "pytest-mock>=3.15.1",
     "python-dotenv>=1.2.2",
+    "ruff>=0.14",
 ]

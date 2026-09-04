@@ -44,6 +44,13 @@ from ..config_loader import PatternRegistry
 # 1. Structural normalization (language-agnostic)
 # ---------------------------------------------------------------------------
 
+# Above this length text is refused rather than scanned. Every scan here is
+# unbounded in the length of its input, so one very large paste is a cheap
+# way to occupy a worker; and truncating instead of refusing would publish
+# an offset past which nothing is inspected. Pass max_scan_chars=None to
+# opt out and accept the cost.
+DEFAULT_MAX_SCAN_CHARS = 200_000
+
 _ZERO_WIDTH_CHARS = re.compile(
     r"[\u200B\u200C\u200D\u200E\u200F\uFEFF\u2060-\u2064\u00AD]"
 )
@@ -104,12 +111,21 @@ def normalize_text(text: str) -> str:
     return text
 
 
-def find_encoded_payloads(text: str, min_len: int = 24) -> list[str]:
+# Decoding is not free, and a payload built entirely out of base64-shaped
+# tokens turns one message into thousands of decode calls. The scan reports
+# what it found up to this many candidates per kind; the cap is high enough
+# that no realistic document reaches it and low enough to bound the work.
+MAX_ENCODED_CANDIDATES = 256
+
+
+def find_encoded_payloads(
+    text: str, min_len: int = 24, max_candidates: int = MAX_ENCODED_CANDIDATES,
+) -> list[str]:
     """Look for suspiciously long base64/hex blocks that might hide
     instructions intended for the model to decode and follow.
     Language-agnostic: this depends on token shape, not textual content."""
     findings = []
-    for token in re.findall(r"[A-Za-z0-9+/=]{%d,}" % min_len, text):
+    for token in re.findall(r"[A-Za-z0-9+/=]{%d,}" % min_len, text)[:max_candidates]:
         try:
             decoded = base64.b64decode(token, validate=True)
             decoded_text = decoded.decode("utf-8", errors="ignore")
@@ -117,7 +133,7 @@ def find_encoded_payloads(text: str, min_len: int = 24) -> list[str]:
                 findings.append(decoded_text)
         except (binascii.Error, ValueError):
             continue
-    for token in re.findall(r"(?:[0-9a-fA-F]{2}){12,}", text):
+    for token in re.findall(r"(?:[0-9a-fA-F]{2}){12,}", text)[:max_candidates]:
         # No try/except needed here: the regex only ever matches complete
         # hex-digit pairs, so bytes.fromhex(token) cannot raise.
         decoded_text = bytes.fromhex(token).decode("utf-8", errors="ignore")
@@ -192,6 +208,10 @@ class SanitizationResult:
     hidden_text_hits: list[str] = field(default_factory=list)
     blocked: bool = False
     source_id: str | None = None  # e.g. "user_message", "web:https://...", "rag_chunk_12"
+    # True when the text was longer than `max_scan_chars` and was refused
+    # instead of scanned. See DEFAULT_MAX_SCAN_CHARS for why a refusal beats
+    # scanning a prefix.
+    oversized: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -221,12 +241,16 @@ class Sanitizer:
         include_default_patterns: bool = True,
         registry: PatternRegistry | None = None,
         weights: "RiskWeights | None" = None,
+        max_scan_chars: int | None = DEFAULT_MAX_SCAN_CHARS,
     ):
         self.registry = registry or PatternRegistry.load(
             custom_config_path=pattern_config_path,
             include_defaults=include_default_patterns,
         )
         self.weights = weights or DEFAULT_RISK_WEIGHTS
+        if max_scan_chars is not None and max_scan_chars <= 0:
+            raise ValueError("max_scan_chars must be positive, or None for no limit.")
+        self.max_scan_chars = max_scan_chars
 
     def scan_text(
         self,
@@ -239,6 +263,22 @@ class Sanitizer:
         of its language or origin. Use `tag`/`source_id` to distinguish
         direct user input from external content (web pages, RAG chunks,
         tool outputs) when scanning for indirect prompt injection."""
+        # Oversized input is refused, not truncated. Scanning the first N
+        # characters and reporting the verdict as if it covered the whole
+        # text hands an attacker a documented offset to hide the payload
+        # past; refusing is at least visible to whoever sent it.
+        if self.max_scan_chars is not None and len(text) > self.max_scan_chars:
+            return SanitizationResult(
+                original_text=text,
+                normalized_text="",
+                wrapped_text=wrap_as_data("", tag=tag),
+                risk_score=1.0,
+                matched_patterns=["oversized_input"],
+                blocked=True,
+                source_id=source_id,
+                oversized=True,
+            )
+
         # Invisible codepoints are read off the raw text: normalization is
         # about to remove them, and their decoded contents are exactly what
         # the lexical scan needs to see.

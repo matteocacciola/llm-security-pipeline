@@ -136,7 +136,9 @@ class RedisStateBackend(StateBackend):
                 "Install with: pip install 'llm-security-pipeline[redis]'"
             ) from exc
         return cls(
-            RedisCluster.from_url(url, **cluster_kwargs),
+            # RedisCluster is not a subclass of Redis in the stubs, but it
+            # implements every command this backend issues.
+            RedisCluster.from_url(url, **cluster_kwargs),  # type: ignore[arg-type]
             key_prefix=key_prefix,
             owns_client=True,
             hash_tags=True,

@@ -100,7 +100,7 @@ async def test_single_use_token_redeemed_exactly_once_across_processes(backend_n
 
     guard = ScopeGuard()  # secret_key generated here, shared explicitly with workers below
     token = guard.issue_token(agent_id="sales_bot", scopes=["read_crm"], ttl_seconds=30, max_uses=1)
-    secret_key_hex = guard._secret_key.hex()  # noqa: SLF001 - test needs to share the key across processes
+    secret_key_hex = guard._secret_key.hex()  # test needs to share the key across processes
 
     loop = asyncio.get_running_loop()
     with ProcessPoolExecutor(max_workers=5) as pool:

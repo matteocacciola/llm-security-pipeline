@@ -40,6 +40,12 @@ import hashlib
 from dataclasses import dataclass, field
 
 from ..sessions.stores import ProvenanceRecord, ProvenanceStore
+from ..resilience import (
+    Degraded,
+    PROVENANCE,
+    FailurePolicy,
+    ResilientBackend,
+)
 from .exfil_guard import ExfilGuard
 from .sanitizer import SanitizationResult, Sanitizer
 
@@ -141,10 +147,17 @@ class IngestGuard:
         default_factory=lambda: dict(DEFAULT_THRESHOLDS)
     )
     default_trust: str = UNTRUSTED
+    failure_policy: FailurePolicy | None = None
+    resilience: ResilientBackend | None = None
 
     def __post_init__(self) -> None:
         self.sanitizer = self.sanitizer or Sanitizer()
         self.exfil_guard = self.exfil_guard or ExfilGuard()
+        # Provenance defaults to fail-closed. An unverifiable retrieval is
+        # precisely the state this store exists to tell apart from a
+        # verified one, so answering "verified" when the store is
+        # unreachable would dissolve the distinction the feature is for.
+        self.resilience = self.resilience or ResilientBackend(self.failure_policy)
 
     def _thresholds_for(self, trust: str) -> tuple[float, float]:
         try:
@@ -170,7 +183,15 @@ class IngestGuard:
         trust = trust or self.default_trust
         quarantine_at, reject_at = self._thresholds_for(trust)
 
-        scan = self.sanitizer.scan_text(
+        # Both are filled in by __post_init__; the fields stay Optional so
+        # the constructor can take None to mean "use the default". Reading
+        # them through locals states that invariant once instead of
+        # scattering it, and keeps a type checker honest about the rest.
+        sanitizer, exfil_guard = self.sanitizer, self.exfil_guard
+        if sanitizer is None or exfil_guard is None:  # pragma: no cover - set in __post_init__
+            raise RuntimeError("IngestGuard was constructed without running __post_init__.")
+
+        scan = sanitizer.scan_text(
             content, threshold=quarantine_at, tag="EXTERNAL_CONTENT", source_id=source_id,
         )
         reasons: list[str] = []
@@ -187,7 +208,7 @@ class IngestGuard:
         # it contains no instructions at all: the model will happily
         # reproduce the image markup into an answer, and the fetch happens
         # in the user's client.
-        exfil = self.exfil_guard.scan(content)
+        exfil = exfil_guard.scan(content)
         if exfil.suspicious_findings:
             reasons.append("exfil_url")
             score = max(score, 0.8 if exfil.blocked else 0.5)
@@ -210,6 +231,11 @@ class IngestGuard:
         )
 
     # -- provenance ------------------------------------------------------
+
+    def _resilience(self) -> ResilientBackend:
+        if self.resilience is None:  # pragma: no cover - set in __post_init__
+            raise RuntimeError("IngestGuard was constructed without running __post_init__.")
+        return self.resilience
 
     def _require_store(self) -> ProvenanceStore:
         if self.provenance_store is None:
@@ -237,14 +263,18 @@ class IngestGuard:
         )
         store = self._require_store()
         if verdict.accepted or record_rejected:
-            await store.record(ProvenanceRecord(
+            record = ProvenanceRecord(
                 document_id=verdict.document_id,
                 content_hash=verdict.content_hash,
                 source_id=verdict.source_id,
                 trust=verdict.trust,
                 decision=verdict.decision,
                 risk_score=verdict.risk_score,
-            ))
+            )
+            # A verdict that is not recorded is a document that will read as
+            # "never ingested" forever after, so under a closed policy the
+            # caller is told rather than left to index it.
+            await self._resilience().run(PROVENANCE, lambda: store.record(record))
         return verdict
 
     async def verify_retrieved(self, content: str, *, document_id: str) -> RetrievalVerdict:
@@ -257,7 +287,13 @@ class IngestGuard:
         is usually a pipeline that bypassed the guard.
         """
         store = self._require_store()
-        record = await store.get(document_id)
+        record = await self._resilience().run(PROVENANCE, lambda: store.get(document_id))
+        if isinstance(record, Degraded):
+            # Only reachable under an open policy, which for provenance
+            # means "treat unverifiable as verified". Rarely the right
+            # choice; the reason is recorded so it does not read as a
+            # successful verification.
+            return RetrievalVerdict(document_id, True, "provenance_unavailable")
         if record is None:
             return RetrievalVerdict(document_id, False, "no_provenance_record")
         if record.content_hash != content_hash(content):

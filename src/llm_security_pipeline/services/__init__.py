@@ -8,8 +8,19 @@ from .sanitizer import (
     wrap_as_data,
     decode_tag_characters,
     find_hidden_text,
+    DEFAULT_MAX_SCAN_CHARS,
 )
-from .scope_guard import ScopeGuard, CapabilityToken, ScopeError
+from .scope_guard import (
+    ScopeGuard,
+    CapabilityToken,
+    ScopeError,
+    SigningKeyring,
+    UnknownKeyId,
+    canonical_payload_bytes,
+    DEFAULT_KEY_ID,
+    MAX_TOKEN_CHARS,
+    MIN_KEY_BYTES,
+)
 from .exfil_guard import (
     ExfilGuard,
     ExfilPolicy,
@@ -18,7 +29,14 @@ from .exfil_guard import (
     URLFinding,
     shannon_entropy,
 )
-from .output_guard import OutputGuard, scan_output, OutputScanResult, find_pii, find_secrets
+from .output_guard import (
+    OutputGuard,
+    scan_output,
+    OutputScanResult,
+    find_pii,
+    find_secrets,
+    OVERSIZED_OUTPUT_PLACEHOLDER,
+)
 from .ingest_guard import (
     IngestGuard,
     IngestVerdict,
@@ -40,6 +58,23 @@ from .media_guard import (
     ExifExtractor,
     CallableExtractor,
 )
+from .streaming_guard import (
+    StreamingOutputGuard,
+    StreamDelta,
+    DEFAULT_HOLDBACK_CHARS,
+    DEFAULT_DETECTION_TAIL_CHARS,
+)
+from .detectors import (
+    SemanticDetector,
+    DetectorResult,
+    DetectorEnsemble,
+    EnsembleResult,
+    Registration,
+    CallableDetector,
+    combine_max,
+    ADVISORY,
+    ENFORCING,
+)
 from .rate_limiter import SessionRateLimiter, SessionLimits, RateLimitExceeded
 
 __all__ = [
@@ -52,9 +87,16 @@ __all__ = [
     "wrap_as_data",
     "decode_tag_characters",
     "find_hidden_text",
+    "DEFAULT_MAX_SCAN_CHARS",
     "ScopeGuard",
     "CapabilityToken",
     "ScopeError",
+    "SigningKeyring",
+    "UnknownKeyId",
+    "canonical_payload_bytes",
+    "DEFAULT_KEY_ID",
+    "MAX_TOKEN_CHARS",
+    "MIN_KEY_BYTES",
     "ExfilGuard",
     "ExfilPolicy",
     "ExfilScanResult",
@@ -66,6 +108,20 @@ __all__ = [
     "OutputScanResult",
     "find_pii",
     "find_secrets",
+    "OVERSIZED_OUTPUT_PLACEHOLDER",
+    "StreamingOutputGuard",
+    "StreamDelta",
+    "DEFAULT_HOLDBACK_CHARS",
+    "DEFAULT_DETECTION_TAIL_CHARS",
+    "SemanticDetector",
+    "DetectorResult",
+    "DetectorEnsemble",
+    "EnsembleResult",
+    "Registration",
+    "CallableDetector",
+    "combine_max",
+    "ADVISORY",
+    "ENFORCING",
     "SessionRateLimiter",
     "SessionLimits",
     "IngestGuard",

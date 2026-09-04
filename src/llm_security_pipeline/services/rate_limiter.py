@@ -23,6 +23,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..resilience import (
+    Degraded,
+    RATE_LIMIT,
+    SESSION_RISK,
+    FailurePolicy,
+    ResilientBackend,
+)
 from ..sessions.stores import SessionStore, InMemorySessionStore
 
 
@@ -71,14 +78,33 @@ class SessionRateLimiter:
         await limiter.check_tool_call(session_id)          # before authorizing a tool call
     """
 
-    def __init__(self, limits: SessionLimits | None = None, store: SessionStore | None = None):
+    def __init__(
+        self,
+        limits: SessionLimits | None = None,
+        store: SessionStore | None = None,
+        failure_policy: FailurePolicy | None = None,
+        resilience: ResilientBackend | None = None,
+    ):
         self.limits = limits or SessionLimits()
         # Defaults to an in-memory store, safe only for a single process.
         # Pass a RedisSessionStore explicitly for multi-process/instance deployments.
         self._store = store or InMemorySessionStore()
+        # What happens when that store does not answer. Defaults to open
+        # for both operations here: a counter being unavailable should not
+        # take the product down. See resilience.py for the reasoning, and
+        # note that every degraded call is reported, never silent.
+        self._resilience = resilience or ResilientBackend(failure_policy)
 
     async def check_request(self, session_id: str) -> None:
-        count = await self._store.increment_requests(session_id, self.limits.window_seconds)
+        # Only the round trip goes inside run(): RateLimitExceeded below is
+        # a decision about the traffic, not a backend failure, and must not
+        # be mistaken for one.
+        count = await self._resilience.run(
+            RATE_LIMIT,
+            lambda: self._store.increment_requests(session_id, self.limits.window_seconds),
+        )
+        if isinstance(count, Degraded):
+            return
         if count > self.limits.max_requests_per_window:
             raise RateLimitExceeded(
                 f"Session '{session_id}' exceeded {self.limits.max_requests_per_window} "
@@ -86,7 +112,12 @@ class SessionRateLimiter:
             )
 
     async def check_tool_call(self, session_id: str) -> None:
-        count = await self._store.increment_tool_calls(session_id, self.limits.window_seconds)
+        count = await self._resilience.run(
+            RATE_LIMIT,
+            lambda: self._store.increment_tool_calls(session_id, self.limits.window_seconds),
+        )
+        if isinstance(count, Degraded):
+            return
         if count > self.limits.max_tool_calls_per_window:
             raise RateLimitExceeded(
                 f"Session '{session_id}' exceeded {self.limits.max_tool_calls_per_window} "
@@ -109,22 +140,32 @@ class SessionRateLimiter:
         tenant or source address only has to be more expensive to change
         than the session id is.
         """
-        cumulative = await self._store.add_risk(
-            session_id,
-            risk_delta=risk_score,
-            decay_per_second=self.limits.risk_decay_per_second,
-            flag_threshold=self.limits.cumulative_risk_threshold,
-            ttl_seconds=self.limits.session_ttl_seconds,
-        )
-        if actor_id is not None:
-            await self._store.add_risk(
-                self.actor_key(actor_id),
+        cumulative = await self._resilience.run(
+            SESSION_RISK,
+            lambda: self._store.add_risk(
+                session_id,
                 risk_delta=risk_score,
                 decay_per_second=self.limits.risk_decay_per_second,
-                flag_threshold=self.limits.actor_risk_threshold,
-                ttl_seconds=self.limits.actor_ttl_seconds,
+                flag_threshold=self.limits.cumulative_risk_threshold,
+                ttl_seconds=self.limits.session_ttl_seconds,
+            ),
+        )
+        if actor_id is not None:
+            await self._resilience.run(
+                SESSION_RISK,
+                lambda: self._store.add_risk(
+                    self.actor_key(actor_id),
+                    risk_delta=risk_score,
+                    decay_per_second=self.limits.risk_decay_per_second,
+                    flag_threshold=self.limits.actor_risk_threshold,
+                    ttl_seconds=self.limits.actor_ttl_seconds,
+                ),
             )
-        return cumulative
+        # 0.0 rather than None: the caller feeds this into an audit record,
+        # and a degraded accumulator has genuinely accumulated nothing. The
+        # loss is reported through the degradation callback, not by
+        # smuggling a sentinel into a float.
+        return 0.0 if isinstance(cumulative, Degraded) else cumulative
 
     @staticmethod
     def actor_key(actor_id: str) -> str:
@@ -133,14 +174,23 @@ class SessionRateLimiter:
         return f"actor::{actor_id}"
 
     async def is_session_flagged(self, session_id: str, actor_id: str | None = None) -> bool:
-        if await self._store.is_flagged(session_id):
+        if await self._is_flagged(session_id):
             return True
         if actor_id is not None:
-            return await self._store.is_flagged(self.actor_key(actor_id))
+            return await self._is_flagged(self.actor_key(actor_id))
         return False
 
     async def is_actor_flagged(self, actor_id: str) -> bool:
-        return await self._store.is_flagged(self.actor_key(actor_id))
+        return await self._is_flagged(self.actor_key(actor_id))
+
+    async def _is_flagged(self, key: str) -> bool:
+        # Fail-open here reads as "not flagged", which is the permissive
+        # answer by construction: the flag cannot be read, so nothing it
+        # would have blocked is blocked.
+        flagged = await self._resilience.run(
+            SESSION_RISK, lambda: self._store.is_flagged(key), fallback=False,
+        )
+        return bool(flagged)
 
     async def reset_actor(self, actor_id: str) -> None:
         await self._store.reset_session(self.actor_key(actor_id))

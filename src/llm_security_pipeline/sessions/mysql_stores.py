@@ -149,7 +149,8 @@ async def _with_deadlock_retry(operation):
             last_exc = exc
             # Jittered exponential backoff so retrying sessions don't
             # re-collide in lockstep.
-            await asyncio.sleep(0.005 * (2 ** attempt) * (1 + random.random()))
+            # `random` is fine here: this is retry jitter, not key material.
+            await asyncio.sleep(0.005 * (2 ** attempt) * (1 + random.random()))  # noqa: S311
     raise last_exc  # type: ignore[misc]
 
 
