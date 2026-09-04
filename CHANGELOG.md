@@ -304,6 +304,25 @@ distribution."
   their documented error; streaming equals buffered for any text and any
   chunking.
 
+### Changed — session budget semantics
+
+- **Sliding-window request and tool-call budgets** on every store (in-memory,
+  Redis, PostgreSQL, MySQL). `increment_*` keeps its signature and meaning
+  ("events in the current window including this one"), but the window
+  is now the trailing `window_seconds` rather than a counter that resets
+  at a boundary. Closes the burst-at-the-boundary case where a caller who
+  knows the window spends the budget twice in a few seconds. Redis: a
+  sorted set per key under one Lua script. SQL: a `sentinel_events` row
+  per event plus a row lock on the existing `sentinel_counters` anchor,
+  so the count stays exact across processes; `sentinel_counters.count`
+  was dropped. **Existing SQL schemas need the new table**, which
+  `CREATE TABLE IF NOT EXISTS` on startup handles.
+- **`SessionStore.add_risk` returns `RiskUpdate(cumulative, flagged)`**
+  instead of a float. `SessionRateLimiter.record_turn_risk_and_check()`
+  uses it; `pre_process` no longer calls `is_session_flagged` after
+  recording risk — one round trip fewer per turn with a session, two with
+  an actor. `record_turn_risk()` still returns the float.
+
 ### Changed
 
 - `README.md` rewritten alongside every feature above, then **split**: it

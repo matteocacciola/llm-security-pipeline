@@ -224,8 +224,10 @@ async def test_add_risk_runs_on_a_real_cluster(cluster_store):
     await cluster_store.reset_session(session_id)
     first = await cluster_store.add_risk(session_id, 0.5, 0.0, 1.0, 60)
     second = await cluster_store.add_risk(session_id, 0.6, 0.0, 1.0, 60)
-    assert first == pytest.approx(0.5)
-    assert second == pytest.approx(1.1)
+    assert first.cumulative == pytest.approx(0.5)
+    assert first.flagged is False
+    assert second.cumulative == pytest.approx(1.1)
+    assert second.flagged is True
     assert await cluster_store.is_flagged(session_id) is True
     await cluster_store.reset_session(session_id)
     assert await cluster_store.is_flagged(session_id) is False
@@ -238,7 +240,7 @@ async def test_awkward_session_ids_run_on_a_real_cluster(cluster_store, session_
     """The digest fallback has to hold up where it counts: the server, not
     a local CRC calculation."""
     await cluster_store.reset_session(session_id)
-    assert await cluster_store.add_risk(session_id, 0.3, 0.0, 99.0, 60) == pytest.approx(0.3)
+    assert (await cluster_store.add_risk(session_id, 0.3, 0.0, 99.0, 60)).cumulative == pytest.approx(0.3)
     assert await cluster_store.increment_requests(session_id, 60) == 1
     await cluster_store.reset_session(session_id)
 

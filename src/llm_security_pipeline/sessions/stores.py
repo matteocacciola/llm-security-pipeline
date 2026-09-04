@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
+from typing import NamedTuple
+from collections import deque
 from dataclasses import dataclass, field
 
 
@@ -67,7 +69,34 @@ class SessionCounters:
     flagged: bool
 
 
+class RiskUpdate(NamedTuple):
+    """What add_risk hands back: the new cumulative score and whether the
+    session is flagged AFTER this update (sticky, so it may have been
+    flagged already). Returning both saves the caller a second round trip
+    to ask a question the store just answered."""
+
+    cumulative: float
+    flagged: bool
+
+
 class SessionStore(ABC):
+    """Per-session counters and risk, shared across processes.
+
+    Request and tool-call budgets are **sliding windows**: `increment_*`
+    returns how many events, including this one, fall within the trailing
+    `window_seconds`. A fixed window (count, reset at the boundary) lets
+    a caller who knows where the boundary is spend a full budget just
+    before it and another just after, doubling the limit over a few
+    seconds; a sliding window means "N per W" holds over *every* interval
+    of length W. The cost is one timestamp per event per key, bounded by
+    the budget itself, and it expires with the window.
+
+    Under concurrency the count must be exact — two processes incrementing
+    together get N+1 and N+2, never N+1 twice — which is the property the
+    cross-process tests assert. Redis gets it from the script being
+    atomic; the SQL backends take a row lock on a per-key anchor row.
+    """
+
     @abstractmethod
     async def increment_requests(self, session_id: str, window_seconds: int) -> int:
         ...
@@ -80,11 +109,12 @@ class SessionStore(ABC):
     async def add_risk(
         self, session_id: str, risk_delta: float, decay_per_second: float,
         flag_threshold: float, ttl_seconds: int,
-    ) -> float:
+    ) -> RiskUpdate:
         """Atomically apply time-based decay to the session's cumulative
         risk, add `risk_delta`, persist the result, and return the updated
-        cumulative value. If it crosses `flag_threshold`, mark the session
-        as flagged (sticky until reset_session)."""
+        cumulative value together with the flag state. If the value crosses
+        `flag_threshold`, mark the session as flagged (sticky until
+        reset_session)."""
 
     @abstractmethod
     async def is_flagged(self, session_id: str) -> bool:
@@ -99,19 +129,19 @@ class InMemorySessionStore(SessionStore):
     """Single-process implementation for local development and unit tests."""
 
     def __init__(self):
-        self._requests: dict[str, tuple[int, float]] = {}   # session -> (count, window_expiry)
-        self._tool_calls: dict[str, tuple[int, float]] = {}
+        self._requests: dict[str, deque[float]] = {}   # session -> event timestamps
+        self._tool_calls: dict[str, deque[float]] = {}
         self._risk: dict[str, tuple[float, float]] = {}      # session -> (value, last_update_ts)
         self._flagged: set[str] = set()
 
-    def _incr(self, store: dict[str, tuple[int, float]], session_id: str, window_seconds: int) -> int:
+    def _incr(self, store: dict[str, deque[float]], session_id: str, window_seconds: int) -> int:
         now = time.time()
-        count, expiry = store.get(session_id, (0, 0.0))
-        if now > expiry:
-            count, expiry = 0, now + window_seconds
-        count += 1
-        store[session_id] = (count, expiry)
-        return count
+        events = store.setdefault(session_id, deque())
+        cutoff = now - window_seconds
+        while events and events[0] <= cutoff:
+            events.popleft()
+        events.append(now)
+        return len(events)
 
     async def increment_requests(self, session_id: str, window_seconds: int) -> int:
         return self._incr(self._requests, session_id, window_seconds)
@@ -122,7 +152,7 @@ class InMemorySessionStore(SessionStore):
     async def add_risk(
         self, session_id: str, risk_delta: float, decay_per_second: float,
         flag_threshold: float, ttl_seconds: int,
-    ) -> float:
+    ) -> RiskUpdate:
         now = time.time()
         current, last_update = self._risk.get(session_id, (0.0, now))
         elapsed = max(0.0, now - last_update)
@@ -131,7 +161,7 @@ class InMemorySessionStore(SessionStore):
         self._risk[session_id] = (updated, now)
         if updated >= flag_threshold:
             self._flagged.add(session_id)
-        return updated
+        return RiskUpdate(updated, session_id in self._flagged)
 
     async def is_flagged(self, session_id: str) -> bool:
         return session_id in self._flagged

@@ -41,7 +41,7 @@ import asyncio
 import random
 import time
 
-from .stores import NonceStore, ProvenanceRecord, ProvenanceStore, SessionStore
+from .stores import NonceStore, ProvenanceRecord, ProvenanceStore, RiskUpdate, SessionStore
 
 try:
     import aiomysql
@@ -67,9 +67,16 @@ _DDL_STATEMENTS = [
     CREATE TABLE IF NOT EXISTS sentinel_counters (
         session_id  VARCHAR(255) NOT NULL,
         kind        VARCHAR(32) NOT NULL,
-        count       INT NOT NULL,
         expires_at  DOUBLE NOT NULL,
         PRIMARY KEY (session_id, kind)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS sentinel_events (
+        session_id  VARCHAR(255) NOT NULL,
+        kind        VARCHAR(32) NOT NULL,
+        ts          DOUBLE NOT NULL,
+        INDEX sentinel_events_key_ts (session_id, kind, ts)
     )
     """,
     """
@@ -223,25 +230,48 @@ class MySQLSessionStore(SessionStore):
 
     async def _increment_once(self, session_id: str, kind: str, window_seconds: int) -> int:
         now = time.time()
+        cutoff = now - window_seconds
         async with self._pool.acquire() as conn:
             try:
                 async with conn.cursor() as cur:
                     if self._cleanup.due():
+                        # Events under expired anchors first: an anchor that
+                        # expired has had no event for a whole window.
+                        await cur.execute(
+                            """
+                            DELETE e FROM sentinel_events e
+                            JOIN sentinel_counters c
+                              ON e.session_id = c.session_id AND e.kind = c.kind
+                            WHERE c.expires_at < %s
+                            """, (now,),
+                        )
                         await cur.execute("DELETE FROM sentinel_counters WHERE expires_at < %s", (now,))
                         await cur.execute("DELETE FROM sentinel_risk WHERE expires_at < %s", (now,))
-                    # Same single-statement pattern as the nonce store: an
-                    # expired window resets to 1, an active one increments.
+                    # The upsert takes an exclusive row lock on the anchor
+                    # for the rest of the transaction, serializing every
+                    # increment for this key so the count is exact. Same
+                    # deadlock-retry wrapper as the risk path, in case two
+                    # first-ever inserts for one key race on the gap lock.
                     await cur.execute(
                         """
-                        INSERT INTO sentinel_counters (session_id, kind, count, expires_at)
-                        VALUES (%s, %s, LAST_INSERT_ID(1), %s)
-                        ON DUPLICATE KEY UPDATE
-                            count = LAST_INSERT_ID(IF(expires_at < %s, 1, count + 1)),
-                            expires_at = IF(expires_at < %s, VALUES(expires_at), expires_at)
+                        INSERT INTO sentinel_counters (session_id, kind, expires_at)
+                        VALUES (%s, %s, %s)
+                        ON DUPLICATE KEY UPDATE expires_at = VALUES(expires_at)
                         """,
-                        (session_id, kind, now + window_seconds, now, now),
+                        (session_id, kind, now + window_seconds),
                     )
-                    await cur.execute("SELECT LAST_INSERT_ID()")
+                    await cur.execute(
+                        "DELETE FROM sentinel_events WHERE session_id = %s AND kind = %s AND ts <= %s",
+                        (session_id, kind, cutoff),
+                    )
+                    await cur.execute(
+                        "INSERT INTO sentinel_events (session_id, kind, ts) VALUES (%s, %s, %s)",
+                        (session_id, kind, now),
+                    )
+                    await cur.execute(
+                        "SELECT COUNT(*) FROM sentinel_events WHERE session_id = %s AND kind = %s",
+                        (session_id, kind),
+                    )
                     (count,) = await cur.fetchone()
                 await conn.commit()
                 return int(count)
@@ -258,7 +288,7 @@ class MySQLSessionStore(SessionStore):
     async def add_risk(
         self, session_id: str, risk_delta: float, decay_per_second: float,
         flag_threshold: float, ttl_seconds: int,
-    ) -> float:
+    ) -> RiskUpdate:
         # Float accumulator: LAST_INSERT_ID only carries integers, so this
         # one uses a locked transaction (INSERT IGNORE to guarantee row
         # existence, then SELECT ... FOR UPDATE), under the same retry
@@ -272,7 +302,7 @@ class MySQLSessionStore(SessionStore):
     async def _add_risk_once(
         self, session_id: str, risk_delta: float, decay_per_second: float,
         flag_threshold: float, ttl_seconds: int,
-    ) -> float:
+    ) -> RiskUpdate:
         now = time.time()
         async with self._pool.acquire() as conn:
             try:
@@ -312,7 +342,7 @@ class MySQLSessionStore(SessionStore):
                         (risk, now, flagged, now + ttl_seconds, session_id),
                     )
                 await conn.commit()
-                return float(risk)
+                return RiskUpdate(float(risk), bool(flagged))
             except Exception:
                 await conn.rollback()
                 raise
@@ -331,6 +361,7 @@ class MySQLSessionStore(SessionStore):
     async def reset_session(self, session_id: str) -> None:
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM sentinel_events WHERE session_id = %s", (session_id,))
                 await cur.execute("DELETE FROM sentinel_counters WHERE session_id = %s", (session_id,))
                 await cur.execute("DELETE FROM sentinel_risk WHERE session_id = %s", (session_id,))
             await conn.commit()

@@ -100,15 +100,15 @@ this page says what it covers and where to read more; the details live in
 
 Read in this order the first time; dip in afterwards.
 
-| Page                                                              | What it is for                                                                                                                                                    |
-|-------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| [Architecture and design](docs/architecture.md)                   | How it is put together, what is parallel and what deliberately is not, and the design choices that shape the API. **Read before integrating.**                    |
-| [Installation](docs/installation.md)                              | uv/pip, extras, src layout, and whether you need Redis at all.                                                                                                    |
-| [Deployment](docs/deployment.md)                                  | Multi-process correctness, the signing key, connection reuse, configuration as data (`PipelineConfig`), what happens when the backend is down, input size limits. |
-| [Identity and capability tokens](docs/identity-and-tokens.md)     | Where the identity boundary falls, binding tokens and session state to a principal, rotating the signing key without downtime.                                    |
-| [The guards](docs/guards.md)                                      | Ingestion-time scanning, non-text input, the canary, streaming output, side-channel exfiltration, invisible-codepoint smuggling.                                  |
-| [Detection, tuning and measurement](docs/detection-and-tuning.md) | Extending the patterns, semantic detectors, choosing thresholds, shadow mode, metrics.                                                                            |
-| [Testing](docs/testing.md)                                        | What each test file checks and why, the backend integration tests, the lint and type gates, the audit schema version.                                             |
+| Page | What it is for |
+| --- | --- |
+| [Architecture and design](docs/architecture.md) | How it is put together, what is parallel and what deliberately is not, and the design choices that shape the API. **Read before integrating.** |
+| [Installation](docs/installation.md) | uv/pip, extras, src layout, and whether you need Redis at all. |
+| [Deployment](docs/deployment.md) | Multi-process correctness, the signing key, connection reuse, configuration as data (`PipelineConfig`), what happens when the backend is down, input size limits. |
+| [Identity and capability tokens](docs/identity-and-tokens.md) | Where the identity boundary falls, binding tokens and session state to a principal, rotating the signing key without downtime. |
+| [The guards](docs/guards.md) | Ingestion-time scanning, non-text input, the canary, streaming output, side-channel exfiltration, invisible-codepoint smuggling. |
+| [Detection, tuning and measurement](docs/detection-and-tuning.md) | Extending the patterns, semantic detectors, choosing thresholds, shadow mode, metrics. |
+| [Testing](docs/testing.md) | What each test file checks and why, the backend integration tests, the lint and type gates, the audit schema version. |
 
 Also: [CHANGELOG.md](CHANGELOG.md) for what changed and why, and
 [SECURITY.md](SECURITY.md) for how to report a vulnerability and what is

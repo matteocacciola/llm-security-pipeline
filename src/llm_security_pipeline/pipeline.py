@@ -981,11 +981,11 @@ class SecurityPipeline:
         cumulative = None
         session_flagged = False
         if scoped_session is not None:
-            cumulative = await self.rate_limiter.record_turn_risk(
+            # One call, both answers: the store decides the flag while it
+            # applies the risk, so asking for it separately was a second
+            # (and with an actor, third) round trip for nothing.
+            cumulative, session_flagged = await self.rate_limiter.record_turn_risk_and_check(
                 scoped_session, combined_risk, actor_id=actor_id,
-            )
-            session_flagged = await self.rate_limiter.is_session_flagged(
-                scoped_session, actor_id=actor_id,
             )
 
         await self._audit("input_scan", {

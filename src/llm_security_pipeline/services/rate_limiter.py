@@ -140,7 +140,22 @@ class SessionRateLimiter:
         tenant or source address only has to be more expensive to change
         than the session id is.
         """
-        cumulative = await self._resilience.run(
+        cumulative, _ = await self.record_turn_risk_and_check(session_id, risk_score, actor_id)
+        return cumulative
+
+    async def record_turn_risk_and_check(
+        self, session_id: str, risk_score: float, actor_id: str | None = None,
+    ) -> tuple[float, bool]:
+        """record_turn_risk, plus whether the session or actor is flagged
+        after the update.
+
+        The store already knows the answer — it just decided it — so this
+        reads it from the reply instead of asking again. On the session
+        path that is one round trip fewer per turn with a session, two
+        with an actor. `record_turn_risk` remains for callers that only
+        want the number.
+        """
+        update = await self._resilience.run(
             SESSION_RISK,
             lambda: self._store.add_risk(
                 session_id,
@@ -150,8 +165,9 @@ class SessionRateLimiter:
                 ttl_seconds=self.limits.session_ttl_seconds,
             ),
         )
+        flagged = False if isinstance(update, Degraded) else update.flagged
         if actor_id is not None:
-            await self._resilience.run(
+            actor_update = await self._resilience.run(
                 SESSION_RISK,
                 lambda: self._store.add_risk(
                     self.actor_key(actor_id),
@@ -161,11 +177,14 @@ class SessionRateLimiter:
                     ttl_seconds=self.limits.actor_ttl_seconds,
                 ),
             )
+            if not isinstance(actor_update, Degraded):
+                flagged = flagged or actor_update.flagged
         # 0.0 rather than None: the caller feeds this into an audit record,
         # and a degraded accumulator has genuinely accumulated nothing. The
         # loss is reported through the degradation callback, not by
         # smuggling a sentinel into a float.
-        return 0.0 if isinstance(cumulative, Degraded) else cumulative
+        cumulative = 0.0 if isinstance(update, Degraded) else update.cumulative
+        return cumulative, flagged
 
     @staticmethod
     def actor_key(actor_id: str) -> str:

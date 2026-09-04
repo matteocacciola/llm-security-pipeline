@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import time
 
-from .stores import NonceStore, ProvenanceRecord, ProvenanceStore, SessionStore
+from .stores import NonceStore, ProvenanceRecord, ProvenanceStore, RiskUpdate, SessionStore
 
 try:
     import asyncpg
@@ -46,13 +46,25 @@ CREATE TABLE IF NOT EXISTS sentinel_nonces (
     expires_at  DOUBLE PRECISION NOT NULL
 );
 
+-- Per-key anchor row. Its purpose is the row lock: the upsert on it
+-- serializes concurrent increments for one key, which is what makes the
+-- count below exact rather than racy. expires_at drives cleanup.
 CREATE TABLE IF NOT EXISTS sentinel_counters (
     session_id  TEXT NOT NULL,
     kind        TEXT NOT NULL,
-    count       INTEGER NOT NULL,
     expires_at  DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (session_id, kind)
 );
+
+-- One row per event; the sliding window is a count over the trailing
+-- window_seconds. Rows older than the window are deleted on the next
+-- increment for that key, and wholesale when the anchor expires.
+CREATE TABLE IF NOT EXISTS sentinel_events (
+    session_id  TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    ts          DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sentinel_events_key_ts ON sentinel_events (session_id, kind, ts);
 
 CREATE TABLE IF NOT EXISTS sentinel_risk (
     session_id  TEXT PRIMARY KEY,
@@ -151,26 +163,45 @@ class PostgresSessionStore(SessionStore):
 
     async def _increment(self, session_id: str, kind: str, window_seconds: int) -> int:
         now = time.time()
+        cutoff = now - window_seconds
         async with self._pool.acquire() as conn:
             if self._cleanup.due():
+                # Events first, joined on expired anchors: an anchor that
+                # has expired has had no event for a whole window, so
+                # every event under it is out of the window too.
+                await conn.execute(
+                    """
+                    DELETE FROM sentinel_events e USING sentinel_counters c
+                    WHERE e.session_id = c.session_id AND e.kind = c.kind AND c.expires_at < $1
+                    """, now,
+                )
                 await conn.execute("DELETE FROM sentinel_counters WHERE expires_at < $1", now)
                 await conn.execute("DELETE FROM sentinel_risk WHERE expires_at < $1", now)
-            # Fixed-window counter in one atomic statement: an expired
-            # window resets to 1, an active one increments.
-            row = await conn.fetchrow(
-                """
-                INSERT INTO sentinel_counters (session_id, kind, count, expires_at)
-                VALUES ($1, $2, 1, $3)
-                ON CONFLICT (session_id, kind) DO UPDATE SET
-                    count = CASE WHEN sentinel_counters.expires_at < $4
-                                 THEN 1 ELSE sentinel_counters.count + 1 END,
-                    expires_at = CASE WHEN sentinel_counters.expires_at < $4
-                                      THEN $3 ELSE sentinel_counters.expires_at END
-                RETURNING count
-                """,
-                session_id, kind, now + window_seconds, now,
-            )
-            return int(row["count"])
+            async with conn.transaction():
+                # The upsert takes a row lock on the anchor that lasts for
+                # the transaction, serializing every increment for this
+                # key. Without it two transactions could both count N.
+                await conn.execute(
+                    """
+                    INSERT INTO sentinel_counters (session_id, kind, expires_at)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (session_id, kind) DO UPDATE SET expires_at = $3
+                    """,
+                    session_id, kind, now + window_seconds,
+                )
+                await conn.execute(
+                    "DELETE FROM sentinel_events WHERE session_id = $1 AND kind = $2 AND ts <= $3",
+                    session_id, kind, cutoff,
+                )
+                await conn.execute(
+                    "INSERT INTO sentinel_events (session_id, kind, ts) VALUES ($1, $2, $3)",
+                    session_id, kind, now,
+                )
+                count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM sentinel_events WHERE session_id = $1 AND kind = $2",
+                    session_id, kind,
+                )
+            return int(count)
 
     async def increment_requests(self, session_id: str, window_seconds: int) -> int:
         return await self._increment(session_id, "requests", window_seconds)
@@ -181,7 +212,7 @@ class PostgresSessionStore(SessionStore):
     async def add_risk(
         self, session_id: str, risk_delta: float, decay_per_second: float,
         flag_threshold: float, ttl_seconds: int,
-    ) -> float:
+    ) -> RiskUpdate:
         now = time.time()
         async with self._pool.acquire() as conn:
             # Continuous-decay accumulator in one atomic statement — the
@@ -201,11 +232,11 @@ class PostgresSessionStore(SessionStore):
                                            - GREATEST(0, $3::float8 - sentinel_risk.last_update) * $6::float8)
                                + $2::float8) >= $4::float8,
                     expires_at = $5::float8
-                RETURNING risk
+                RETURNING risk, flagged
                 """,
                 session_id, risk_delta, now, flag_threshold, now + ttl_seconds, decay_per_second,
             )
-            return float(row["risk"])
+            return RiskUpdate(float(row["risk"]), bool(row["flagged"]))
 
     async def is_flagged(self, session_id: str) -> bool:
         now = time.time()
@@ -218,6 +249,7 @@ class PostgresSessionStore(SessionStore):
 
     async def reset_session(self, session_id: str) -> None:
         async with self._pool.acquire() as conn:
+            await conn.execute("DELETE FROM sentinel_events WHERE session_id = $1", session_id)
             await conn.execute("DELETE FROM sentinel_counters WHERE session_id = $1", session_id)
             await conn.execute("DELETE FROM sentinel_risk WHERE session_id = $1", session_id)
 

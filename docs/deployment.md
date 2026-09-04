@@ -103,6 +103,31 @@ deliberately *not* a setting, so a config file that gets committed does not
 become a key that gets committed. `pipeline.config_summary` gives the
 running posture back as data, for a startup log line or a health endpoint.
 
+## How the session budget counts
+
+Request and tool-call budgets are **sliding windows**, not fixed ones.
+`max_requests_per_window=N` with `window_seconds=W` means at most N
+requests in *any* trailing interval of length W. A fixed window (a counter
+that resets on the boundary) lets a caller who knows where the boundary
+falls spend N just before it and N just after — double the budget in a few
+seconds. A sliding window has no boundary to find.
+
+The cost is one timestamp per event per key, bounded by the budget itself
+and expiring with the window: a sorted set in Redis, an event row in
+PostgreSQL and MySQL, a deque in memory. Refused requests still count, so a
+caller hammering the limit keeps itself locked out rather than probing for
+the moment the window frees up.
+
+The count is exact under concurrency — two processes incrementing at once
+get N+1 and N+2, never N+1 twice — which the cross-process tests assert.
+Redis gets that from the script being atomic; the SQL backends take a row
+lock on a per-key anchor row for the duration of the transaction.
+
+Risk accumulation returns the flag state in the same reply
+(`RiskUpdate(cumulative, flagged)`), so a turn with a session costs one
+round trip to the store rather than two, and one with an actor two rather
+than four.
+
 ## When the backend is down
 
 Every degraded decision is also counted in `degradations_total`; see

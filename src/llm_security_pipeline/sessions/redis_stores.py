@@ -22,10 +22,11 @@ Requires the optional `redis` extra:
 
 from __future__ import annotations
 
+import secrets
 import time
 
 from .redis_keys import HashTagPolicy, hash_tag, validate_key_prefix
-from .stores import NonceStore, ProvenanceRecord, ProvenanceStore, SessionStore
+from .stores import NonceStore, ProvenanceRecord, ProvenanceStore, RiskUpdate, SessionStore
 
 try:
     from redis.asyncio import Redis
@@ -33,10 +34,12 @@ except ImportError:  # pragma: no cover - redis is an optional dependency
     Redis = None  # type: ignore
 
 
-# Atomic "increment with TTL set on first write" — the standard safe
-# rate-limiting primitive in Redis. Doing this as one Lua script avoids the
-# race where a process crashes between INCR and EXPIRE, which would leave
-# the key without a TTL and leak memory forever.
+# Atomic "increment with TTL set on first write". Used by the nonce store
+# for token use counts, where a fixed TTL is the right shape: a token's
+# uses are bounded over its lifetime, not over a trailing window. (The
+# session budgets used to share it; they moved to the sliding-window
+# script below.) One Lua script rather than INCR then EXPIRE, so a crash
+# between the two cannot leave a key with no TTL.
 _INCR_WITH_TTL_SCRIPT = """
 local current = redis.call('INCR', KEYS[1])
 if tonumber(current) == 1 then
@@ -72,7 +75,25 @@ if updated >= flag_threshold then
     redis.call('SET', flag_key, '1', 'EX', ttl)
 end
 
-return tostring(updated)
+-- Both values in one reply: the caller would otherwise come straight back
+-- with EXISTS on the flag key to learn what this script just decided.
+return {tostring(updated), redis.call('EXISTS', flag_key)}
+"""
+
+# Sliding window over a sorted set of event timestamps. ZREMRANGEBYSCORE
+# drops what has aged out of the window, ZADD records this event under a
+# member unique even at identical timestamps, ZCARD is the answer. Atomic
+# because it is one script, so two processes cannot both read N.
+_SLIDING_WINDOW_SCRIPT = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local member = ARGV[3]
+
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)
+redis.call('ZADD', key, now, member)
+redis.call('EXPIRE', key, math.ceil(window))
+return redis.call('ZCARD', key)
 """
 
 
@@ -132,7 +153,7 @@ class RedisSessionStore(SessionStore):
         self._redis = redis_client
         self._key_prefix = key_prefix
         self._tags = HashTagPolicy(hash_tags)
-        self._incr_script = self._redis.register_script(_INCR_WITH_TTL_SCRIPT)
+        self._window_script = self._redis.register_script(_SLIDING_WINDOW_SCRIPT)
         self._add_risk_script = self._redis.register_script(_ADD_RISK_SCRIPT)
 
     async def _keys(self, session_id: str, *fields: str) -> list[str]:
@@ -144,26 +165,29 @@ class RedisSessionStore(SessionStore):
 
         return [f"{base}:{field}" for field in fields]
 
-    async def increment_requests(self, session_id: str, window_seconds: int) -> int:
-        (key,) = await self._keys(session_id, "requests")
-        result = await self._incr_script(keys=[key], args=[window_seconds])
+    async def _slide(self, session_id: str, field: str, window_seconds: int) -> int:
+        (key,) = await self._keys(session_id, field)
+        result = await self._window_script(
+            keys=[key], args=[time.time(), window_seconds, secrets.token_hex(8)],
+        )
         return int(result)
 
+    async def increment_requests(self, session_id: str, window_seconds: int) -> int:
+        return await self._slide(session_id, "requests", window_seconds)
+
     async def increment_tool_calls(self, session_id: str, window_seconds: int) -> int:
-        (key,) = await self._keys(session_id, "tool_calls")
-        result = await self._incr_script(keys=[key], args=[window_seconds])
-        return int(result)
+        return await self._slide(session_id, "tool_calls", window_seconds)
 
     async def add_risk(
         self, session_id: str, risk_delta: float, decay_per_second: float,
         flag_threshold: float, ttl_seconds: int,
-    ) -> float:
+    ) -> RiskUpdate:
         keys = await self._keys(session_id, "risk", "risk_last", "flagged")
-        result = await self._add_risk_script(
+        updated, flagged = await self._add_risk_script(
             keys=keys,
             args=[risk_delta, decay_per_second, time.time(), ttl_seconds, flag_threshold],
         )
-        return float(result)
+        return RiskUpdate(float(updated), bool(int(flagged)))
 
     async def is_flagged(self, session_id: str) -> bool:
         (flag_key,) = await self._keys(session_id, "flagged")
