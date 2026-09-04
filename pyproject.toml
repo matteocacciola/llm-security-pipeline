@@ -34,7 +34,7 @@ dependencies = [
 Homepage = "https://github.com/matteocacciola/llm-security-pipeline"
 Repository = "https://github.com/matteocacciola/llm-security-pipeline"
 Issues = "https://github.com/matteocacciola/llm-security-pipeline/issues"
-Changelog = "https://github.com/matteocacciola/llm-security-pipeline/releases"
+Changelog = "https://github.com/matteocacciola/llm-security-pipeline/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 redis = ["redis>=5.0"]
@@ -138,6 +138,7 @@ source = ["llm_security_pipeline"]
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6.100",
     "mypy>=1.13",
     "prometheus-client>=0.20",
     "pymysql>=1.2.0",

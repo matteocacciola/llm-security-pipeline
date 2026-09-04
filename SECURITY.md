@@ -80,7 +80,7 @@ knowing about.
   docstring. Use a `StateBackend`.
 - **An unauthenticated `session_id` being forgeable.** The library receives
   a principal, it cannot verify one; that boundary is deliberate and
-  permanent. See the *Identity* section of the README.
+  permanent. See [Identity](docs/identity-and-tokens.md#identity).
 - **Object-level authorization.** Whether this user may touch account 42 is
   your data model's question. The library carries and verifies signed
   constraints; it does not decide policy.

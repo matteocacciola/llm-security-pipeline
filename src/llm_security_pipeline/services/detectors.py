@@ -50,7 +50,10 @@ server going down cannot quietly lower every risk score in the system.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
@@ -214,7 +217,21 @@ class DetectorEnsemble:
         resilience: ResilientBackend | None = None,
         failure_policy: FailurePolicy | None = None,
         combine: Callable[[float, EnsembleResult], float] = combine_max,
+        cache_size: int = 0,
+        cache_ttl_seconds: float = 300.0,
     ):
+        # Off by default. Worth turning on in front of a network-backed
+        # judge: the same chunk retrieved by two queries, or the same
+        # message on a retry, is otherwise paid for twice. Keyed by a hash
+        # of the text so the cache holds no user content, bounded by
+        # `cache_size` (LRU) and `cache_ttl_seconds` so a detector that is
+        # re-tuned is not answered from before the re-tune forever.
+        # Errors are never cached: a failed call should be retried, not
+        # remembered.
+        self._cache: OrderedDict[str, tuple[float, EnsembleResult]] = OrderedDict()
+        self._cache_size = cache_size
+        self._cache_ttl = cache_ttl_seconds
+        self.cache_hits = 0
         self.registrations = list(registrations or [])
         names = [r.name for r in self.registrations]
         duplicates = {n for n in names if names.count(n) > 1}
@@ -237,6 +254,31 @@ class DetectorEnsemble:
         if not self.registrations:
             return EnsembleResult()
 
+        key = self._cache_key(text) if self._cache_size else None
+        if key is not None:
+            cached = self._cache.get(key)
+            if cached is not None and time.monotonic() - cached[0] < self._cache_ttl:
+                self._cache.move_to_end(key)
+                self.cache_hits += 1
+                return cached[1]
+
+        result = await self._score_uncached(text)
+
+        if key is not None and not result.errors:
+            self._cache[key] = (time.monotonic(), result)
+            self._cache.move_to_end(key)
+            while len(self._cache) > self._cache_size:
+                self._cache.popitem(last=False)
+        return result
+
+    def _cache_key(self, text: str) -> str:
+        # Registrations are part of the key: the same text scored by a
+        # different set of detectors, or the same detector in a different
+        # mode, is a different answer.
+        config = "|".join(f"{r.name}:{r.mode}:{r.weight}:{r.threshold}" for r in self.registrations)
+        return hashlib.sha256(f"{config}\x00{text}".encode()).hexdigest()
+
+    async def _score_uncached(self, text: str) -> EnsembleResult:
         outcomes = await asyncio.gather(
             *(self._run_one(r, text) for r in self.registrations)
         )
@@ -284,7 +326,7 @@ class DetectorEnsemble:
                 captured["error"] = f"{type(exc).__name__}: {exc}"[:200]
                 raise
 
-        raw = await self._resilience.run(DETECTOR, call)
+        raw = await self._resilience.run(DETECTOR, call, instance=registration.name)
         if isinstance(raw, Degraded):
             return captured.get("error", "unavailable (timed out or circuit open)")
         return _normalize(registration.name, raw)

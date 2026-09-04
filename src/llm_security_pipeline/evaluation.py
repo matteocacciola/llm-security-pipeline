@@ -38,9 +38,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from pathlib import Path
 
 from .services.sanitizer import Sanitizer
+
+if TYPE_CHECKING:
+    from .services.detectors import DetectorEnsemble, EnsembleResult
 
 ATTACK = "attack"
 BENIGN = "benign"
@@ -91,6 +95,52 @@ class ThresholdReport:
 DEFAULT_THRESHOLDS = tuple(round(0.05 * i, 2) for i in range(1, 21))
 
 
+def sweep_scores(
+    scored: list[tuple[LabeledSample, float]],
+    thresholds: tuple[float, ...] = DEFAULT_THRESHOLDS,
+) -> list[ThresholdReport]:
+    """Confusion matrix at each threshold over an already-scored corpus.
+
+    Shared by the lexical evaluator and the detector evaluator: the
+    arithmetic does not care where the numbers came from.
+    """
+    reports = []
+    for threshold in thresholds:
+        tp = fp = tn = fn = 0
+        for sample, score in scored:
+            flagged = score >= threshold
+            if sample.label == ATTACK:
+                tp, fn = (tp + 1, fn) if flagged else (tp, fn + 1)
+            else:
+                fp, tn = (fp + 1, tn) if flagged else (fp, tn + 1)
+        reports.append(ThresholdReport(threshold, tp, fp, tn, fn))
+    return reports
+
+
+def recommend_from(
+    reports: list[ThresholdReport], max_false_positive_rate: float = 0.01,
+) -> ThresholdReport:
+    """Lowest threshold whose false-positive rate stays within budget, or
+    the least-bad option if none does. See Evaluator.recommend for why the
+    budget is stated as a false-positive rate and not an F1 target."""
+    affordable = [r for r in reports if r.false_positive_rate <= max_false_positive_rate]
+    if not affordable:
+        return min(reports, key=lambda r: r.false_positive_rate)
+    return min(affordable, key=lambda r: r.threshold)
+
+
+def format_sweep(reports: list[ThresholdReport]) -> str:
+    rows = ["threshold  recall  precision   FPR    TP  FP  TN  FN",
+            "--------------------------------------------------------"]
+    for r in reports:
+        rows.append(
+            f"   {r.threshold:.2f}     {r.recall:.2f}      {r.precision:.2f}    "
+            f"{r.false_positive_rate:.3f}  {r.true_positives:3d} {r.false_positives:3d} "
+            f"{r.true_negatives:3d} {r.false_negatives:3d}"
+        )
+    return "\n".join(rows)
+
+
 class Evaluator:
     """Scores a labelled corpus once and reports the confusion matrix at
     each candidate threshold.
@@ -113,18 +163,7 @@ class Evaluator:
         samples: list[LabeledSample],
         thresholds: tuple[float, ...] = DEFAULT_THRESHOLDS,
     ) -> list[ThresholdReport]:
-        scored = self.score(samples)
-        reports = []
-        for threshold in thresholds:
-            tp = fp = tn = fn = 0
-            for sample, score in scored:
-                flagged = score >= threshold
-                if sample.label == ATTACK:
-                    tp, fn = (tp + 1, fn) if flagged else (tp, fn + 1)
-                else:
-                    fp, tn = (fp + 1, tn) if flagged else (fp, tn + 1)
-            reports.append(ThresholdReport(threshold, tp, fp, tn, fn))
-        return reports
+        return sweep_scores(self.score(samples), thresholds)
 
     def recommend(
         self,
@@ -142,13 +181,7 @@ class Evaluator:
         false-positive rate is a decision the operator can actually reason
         about.
         """
-        reports = self.sweep(samples, thresholds)
-        affordable = [r for r in reports if r.false_positive_rate <= max_false_positive_rate]
-        if not affordable:
-            # Nothing meets the budget: hand back the least-bad option
-            # rather than pretending one exists.
-            return min(reports, key=lambda r: r.false_positive_rate)
-        return min(affordable, key=lambda r: r.threshold)
+        return recommend_from(self.sweep(samples, thresholds), max_false_positive_rate)
 
     def misclassified(
         self, samples: list[LabeledSample], threshold: float = 0.6,
@@ -169,15 +202,160 @@ class Evaluator:
         samples: list[LabeledSample],
         thresholds: tuple[float, ...] = DEFAULT_THRESHOLDS,
     ) -> str:
-        rows = ["threshold  recall  precision   FPR    TP  FP  TN  FN",
-                "--------------------------------------------------------"]
-        for r in self.sweep(samples, thresholds):
+        return format_sweep(self.sweep(samples, thresholds))
+
+
+# ---------------------------------------------------------------------------
+# Detector evaluation
+# ---------------------------------------------------------------------------
+# A registered detector is advisory until someone has looked at its numbers
+# on their own traffic. This is where those numbers come from. Every
+# detector is scored once over the corpus — the expensive half, and for a
+# network-backed judge a genuinely expensive one — and then each detector
+# gets its own sweep, next to the lexical score and the combined score, so
+# the question "does promoting this one buy recall I don't already have"
+# has an answer.
+
+
+@dataclass(frozen=True)
+class DetectorScores:
+    """Per-sample scores from one evaluation pass, keyed by signal name.
+    `lexical` and `combined` are always present; the rest are detector
+    names. A detector that errored on a sample is absent for that sample
+    rather than recorded as 0.0."""
+
+    samples: tuple[LabeledSample, ...]
+    by_signal: dict[str, list[tuple[LabeledSample, float]]]
+    errors: dict[str, int]
+
+    @property
+    def signals(self) -> list[str]:
+        return list(self.by_signal)
+
+
+class DetectorEvaluator:
+    """Scores a corpus through a DetectorEnsemble alongside the lexical
+    scan, and reports each signal separately.
+
+        evaluator = DetectorEvaluator(pipeline.detectors)
+        scores = await evaluator.score(load_samples("corpus.jsonl"))
+        print(evaluator.report(scores))
+        print(evaluator.promotion_report(scores, max_false_positive_rate=0.01))
+
+    The ensemble is used with every detector treated as enforcing for the
+    purpose of the sweep — an advisory detector's own score is what is
+    being measured, and its mode is exactly the thing this is meant to
+    help decide.
+    """
+
+    def __init__(self, ensemble: "DetectorEnsemble", sanitizer: Sanitizer | None = None):
+        self.ensemble = ensemble
+        self.sanitizer = sanitizer or Sanitizer()
+
+    async def score(self, samples: list[LabeledSample]) -> DetectorScores:
+        by_signal: dict[str, list[tuple[LabeledSample, float]]] = {"lexical": [], "combined": []}
+        for registration in self.ensemble.registrations:
+            by_signal[registration.name] = []
+        errors: dict[str, int] = {}
+
+        for sample in samples:
+            lexical = self.sanitizer.scan_text(sample.text, source_id=sample.source_id).risk_score
+            result = await self.ensemble.score(sample.text)
+            by_signal["lexical"].append((sample, lexical))
+            # Combined the way the pipeline would if every detector were
+            # enforcing: max over all weighted contributions, which is
+            # enforcing_score + advisory_score merged.
+            best = max(result.enforcing_score, result.advisory_score)
+            by_signal["combined"].append((sample, self.ensemble.combine(lexical, _as_enforcing(result, best))))
+            for detector_result in result.results:
+                by_signal[detector_result.detector].append((sample, detector_result.score))
+            for name in result.errors:
+                errors[name] = errors.get(name, 0) + 1
+
+        return DetectorScores(tuple(samples), by_signal, errors)
+
+    def sweep(
+        self,
+        scores: DetectorScores,
+        signal: str,
+        thresholds: tuple[float, ...] = DEFAULT_THRESHOLDS,
+    ) -> list[ThresholdReport]:
+        return sweep_scores(scores.by_signal[signal], thresholds)
+
+    def recommend(
+        self,
+        scores: DetectorScores,
+        signal: str,
+        max_false_positive_rate: float = 0.01,
+        thresholds: tuple[float, ...] = DEFAULT_THRESHOLDS,
+    ) -> ThresholdReport:
+        return recommend_from(self.sweep(scores, signal, thresholds), max_false_positive_rate)
+
+    def report(
+        self, scores: DetectorScores, thresholds: tuple[float, ...] = DEFAULT_THRESHOLDS,
+    ) -> str:
+        sections = []
+        for signal in scores.signals:
+            header = f"== {signal} =="
+            if signal in scores.errors:
+                header += f"  ({scores.errors[signal]} sample(s) errored and were excluded)"
+            sections.append(header + "\n" + format_sweep(self.sweep(scores, signal, thresholds)))
+        return "\n\n".join(sections)
+
+    def promotion_report(
+        self,
+        scores: DetectorScores,
+        max_false_positive_rate: float = 0.01,
+        thresholds: tuple[float, ...] = DEFAULT_THRESHOLDS,
+    ) -> str:
+        """The question a detector's owner is actually asking: at the
+        false-positive budget I can afford, what recall does each signal
+        give me, and does the combination beat the lexical scan alone?
+
+        A detector whose recommended-threshold recall is no better than
+        the lexical scan's is not worth promoting; it is paying latency for
+        signal that is already there.
+        """
+        lexical = self.recommend(scores, "lexical", max_false_positive_rate, thresholds)
+        rows = [
+            f"false-positive budget: {max_false_positive_rate:.3f}",
+            "",
+            f"{'signal':<24} {'threshold':>9} {'recall':>7} {'FPR':>7}   verdict",
+            "-" * 64,
+        ]
+        for signal in scores.signals:
+            scored = len(scores.by_signal[signal])
+            if scored == 0:
+                rows.append(f"{signal:<24} {'-':>9} {'-':>7} {'-':>7}   no data: errored on every sample")
+                continue
+            best = self.recommend(scores, signal, max_false_positive_rate, thresholds)
+            within = best.false_positive_rate <= max_false_positive_rate
+            if signal == "lexical":
+                verdict = "baseline"
+            elif not within:
+                verdict = "cannot meet budget at any threshold"
+            elif best.recall > lexical.recall:
+                verdict = f"+{best.recall - lexical.recall:.2f} recall over lexical"
+            else:
+                verdict = "no recall gained over lexical; not worth promoting"
+            if signal in scores.errors:
+                # A recall computed over a subset of the corpus is not
+                # comparable to one computed over all of it.
+                verdict += f" [only {scored}/{len(scores.samples)} scored; {scores.errors[signal]} errored]"
             rows.append(
-                f"   {r.threshold:.2f}     {r.recall:.2f}      {r.precision:.2f}    "
-                f"{r.false_positive_rate:.3f}  {r.true_positives:3d} {r.false_positives:3d} "
-                f"{r.true_negatives:3d} {r.false_negatives:3d}"
+                f"{signal:<24} {best.threshold:>9.2f} {best.recall:>7.2f} "
+                f"{best.false_positive_rate:>7.3f}   {verdict}"
             )
         return "\n".join(rows)
+
+
+def _as_enforcing(result: "EnsembleResult", score: float) -> "EnsembleResult":
+    from .services.detectors import EnsembleResult
+
+    return EnsembleResult(
+        results=result.results, errors=result.errors,
+        enforcing_score=score, advisory_score=0.0,
+    )
 
 
 # ---------------------------------------------------------------------------

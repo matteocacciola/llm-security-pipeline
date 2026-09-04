@@ -30,6 +30,8 @@ from .exfil_guard import (
     shannon_entropy,
 )
 from .output_guard import (
+    Canary,
+    CANARY_CATEGORY,
     OutputGuard,
     scan_output,
     OutputScanResult,
@@ -109,6 +111,8 @@ __all__ = [
     "find_pii",
     "find_secrets",
     "OVERSIZED_OUTPUT_PLACEHOLDER",
+    "Canary",
+    "CANARY_CATEGORY",
     "StreamingOutputGuard",
     "StreamDelta",
     "DEFAULT_HOLDBACK_CHARS",

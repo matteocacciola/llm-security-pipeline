@@ -85,7 +85,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from collections.abc import AsyncIterator, Awaitable
-from typing import Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .services import (
     ExfilGuard,
@@ -106,6 +106,7 @@ from .services import (
     SessionLimits,
     RateLimitExceeded,
 )
+from .services.output_guard import Canary
 from .services.detectors import (
     DetectorEnsemble,
     EnsembleResult,
@@ -119,6 +120,7 @@ from .services.streaming_guard import (
 from .metrics import MetricsSink, SafeMetricsSink
 from .resilience import (
     AUDIT,
+    OPERATIONS,
     Degradation,
     FailurePolicy,
     ResilientBackend,
@@ -126,7 +128,15 @@ from .resilience import (
 from .sessions.stores import ProvenanceRecord
 from .state_backend import StateBackend, RedisStateBackend
 
+if TYPE_CHECKING:
+    from .config import PipelineConfig
+
 logger = logging.getLogger(__name__)
+
+# Stamped on every audit event. Bump it when a field is added, renamed or
+# changes meaning, so a consumer parsing the stream can branch on it instead
+# of discovering the change when its parser breaks. History in CHANGELOG.md.
+AUDIT_SCHEMA_VERSION = 2
 
 # Degradations collected for the request currently being handled. A
 # ContextVar rather than an attribute because one SecurityPipeline serves
@@ -409,6 +419,7 @@ class SecurityPipeline:
         failure_policy: FailurePolicy | None = None,
         detectors: "list[Registration] | DetectorEnsemble | None" = None,
         metrics: MetricsSink | None = None,
+        canary: "Canary | bool | None" = None,
         rate_limiter: SessionRateLimiter | None = None,
         audit_logger: AuditLogger | None = None,
         pii_config_path: str | None = None,
@@ -472,6 +483,14 @@ class SecurityPipeline:
                 "scope_secret_key is shorthand for a one-key keyring; pass a "
                 "SigningKeyring as soon as you need to rotate."
             )
+        # A canary is only useful if the prompt sent to the model is the
+        # planted one, so the pipeline exposes it: send `planted_system_prompt`.
+        if canary is True:
+            canary = Canary.generate()
+        self.canary: Canary | None = canary or None
+        if self.canary is not None and system_prompt is None:
+            raise ValueError("A canary needs a system_prompt to be planted in.")
+
         # Aggregate counters, kept deliberately separate from the audit
         # log: that one is per-request and keeps identifiers, this one is
         # aggregate and carries none. See metrics.py.
@@ -527,7 +546,12 @@ class SecurityPipeline:
         self.output_guard = output_guard or OutputGuard(
             pattern_config_path=pii_config_path,
             include_default_patterns=include_default_pii_patterns,
+            canaries=(self.canary,) if self.canary is not None else None,
         )
+        if output_guard is not None and self.canary is not None and self.canary not in output_guard.canaries:
+            # A caller-supplied guard has to know about the canary too, or
+            # the marker is planted and nothing is watching for it.
+            output_guard.canaries = (*output_guard.canaries, self.canary)
 
         # Side-channel guard. Enabled by default with no allowlist, where it
         # still catches the unambiguous cases (data: URIs, embedded
@@ -610,6 +634,57 @@ class SecurityPipeline:
         self.external_scan_parallel_min_chunks = external_scan_parallel_min_chunks
         self.large_input_offload_threshold_chars = large_input_offload_threshold_chars
 
+    @classmethod
+    def from_config(cls, config: "PipelineConfig", **objects: Any) -> "SecurityPipeline":
+        """Build a pipeline from a PipelineConfig plus the per-process
+        objects a config cannot carry (backend, executor, sinks, guards).
+
+        Passing a setting as a keyword here is refused rather than merged:
+        with two sources for one value there is no way to tell, reading
+        the call, which one won.
+        """
+        from .config import SETTING_KWARGS
+
+        clash = SETTING_KWARGS & set(objects)
+        if clash:
+            raise ValueError(
+                f"{', '.join(sorted(clash))} are settings and belong in the "
+                "PipelineConfig, not alongside it. Only objects (state_backend, "
+                "audit_logger, metrics, guards, executors, keys) go here."
+            )
+        return cls(**config.to_kwargs(), **objects)
+
+    @property
+    def config_summary(self) -> dict[str, Any]:
+        """The settings this pipeline is running with, as data. For a
+        startup log line or a health endpoint: the posture, not the objects."""
+        return {
+            "session_identity": self.session_identity,
+            "enforcement": self.enforcement,
+            "input_risk_threshold": self.input_risk_threshold,
+            "output_overlap_threshold": self.output_overlap_threshold,
+            "canary": self.canary is not None,
+            "detectors": {r.name: r.mode for r in self.detectors.registrations},
+            "failure_policy": {op: self.failure_policy.decision_for(op) for op in OPERATIONS},
+            "signing_key_ids": list(self.scope_guard.keyring.key_ids),
+            "active_key_id": self.scope_guard.active_key_id,
+            "metrics": self.metrics.enabled,
+        }
+
+    @property
+    def planted_system_prompt(self) -> str | None:
+        """The system prompt to actually send to the model.
+
+        With a canary configured this differs from `system_prompt` by one
+        planted line, and sending the original instead means the canary
+        guards nothing. Without one it is the same string.
+        """
+        if self.system_prompt is None:
+            return None
+        if self.canary is None:
+            return self.system_prompt
+        return self.canary.plant(self.system_prompt)
+
     # -- Streaming output -------------------------------------------------
 
     def guard_stream(
@@ -685,7 +760,8 @@ class SecurityPipeline:
         the line was describing. Set `FailurePolicy(audit="closed")` if your
         compliance position is that an unlogged request must not happen.
         """
-        await self._resilience.run(AUDIT, lambda: self.audit.log(event_type, data))
+        stamped = {"schema_version": AUDIT_SCHEMA_VERSION, **data}
+        await self._resilience.run(AUDIT, lambda: self.audit.log(event_type, stamped))
 
     # -- Lifecycle -----------------------------------------------------
 

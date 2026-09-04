@@ -282,10 +282,12 @@ class ResilientBackend:
     ):
         self.policy = policy or DEFAULT_FAILURE_POLICY
         self._on_degraded = on_degraded
-        self._breakers = {
-            operation: _CircuitBreaker(self.policy.failure_threshold, self.policy.recovery_seconds)
-            for operation in OPERATIONS
-        }
+        # Keyed by (operation, instance). Most operations have one
+        # instance — there is one nonce store — but detectors have one
+        # breaker EACH: a breaker shared across the category would let one
+        # broken model server switch off every other detector alongside
+        # it, which is a healthy signal lost to an unrelated failure.
+        self._breakers: dict[tuple[str, str], _CircuitBreaker] = {}
 
     def with_callback(
         self, on_degraded: Callable[[Degradation], Awaitable[None] | None],
@@ -294,11 +296,21 @@ class ResilientBackend:
         self._on_degraded = on_degraded
         return self
 
+    def _breaker(self, operation: str, instance: str) -> _CircuitBreaker:
+        key = (operation, instance)
+        breaker = self._breakers.get(key)
+        if breaker is None:
+            breaker = self._breakers[key] = _CircuitBreaker(
+                self.policy.failure_threshold, self.policy.recovery_seconds,
+            )
+        return breaker
+
     async def run(
         self,
         operation: str,
         call: Callable[[], Awaitable[T]],
         fallback: T | Degraded = DEGRADED,
+        instance: str = "",
     ) -> T | Degraded:
         """Run `call`, returning `fallback` if the backend fails and the
         policy for `operation` is open.
@@ -310,7 +322,7 @@ class ResilientBackend:
         unreachable backend.
         """
         decision = self.policy.decision_for(operation)
-        breaker = self._breakers[operation]
+        breaker = self._breaker(operation, instance)
 
         if breaker.is_tripped:
             return await self._degrade(

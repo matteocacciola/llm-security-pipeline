@@ -1,5 +1,6 @@
 from .config_loader import PatternRegistry, PatternConfigError, load_pattern_file
 from .pipeline import (
+    AUDIT_SCHEMA_VERSION,
     GuardedStream,
     SecurityPipeline,
     PreProcessResult,
@@ -8,7 +9,17 @@ from .pipeline import (
     StdoutAuditLogger,
     RedisStreamAuditLogger,
 )
-from .evaluation import Evaluator, LabeledSample, ThresholdReport, load_samples, smoke_corpus
+from .evaluation import (
+    Evaluator,
+    DetectorEvaluator,
+    DetectorScores,
+    LabeledSample,
+    ThresholdReport,
+    load_samples,
+    smoke_corpus,
+    sweep_scores,
+    recommend_from,
+)
 from .sessions import (
     NonceStore,
     ProvenanceStore,
@@ -66,6 +77,8 @@ from .services import (
     scan_output,
     OutputScanResult,
     OVERSIZED_OUTPUT_PLACEHOLDER,
+    Canary,
+    CANARY_CATEGORY,
     StreamingOutputGuard,
     StreamDelta,
     DEFAULT_HOLDBACK_CHARS,
@@ -84,6 +97,13 @@ from .services import (
     SessionRateLimiter,
     SessionLimits,
     RateLimitExceeded,
+)
+from .config import (
+    PipelineConfig,
+    ThresholdConfig,
+    PatternConfig,
+    ExfilConfig,
+    ParallelismConfig,
 )
 from .metrics import (
     MetricsSink,
@@ -120,6 +140,12 @@ __all__ = [
     "SecurityPipeline",
     "PreProcessResult",
     "PostProcessResult",
+    # Configuration
+    "PipelineConfig",
+    "ThresholdConfig",
+    "PatternConfig",
+    "ExfilConfig",
+    "ParallelismConfig",
     # Metrics
     "MetricsSink",
     "NullMetricsSink",
@@ -192,9 +218,12 @@ __all__ = [
     "scan_output",
     "OutputScanResult",
     "OVERSIZED_OUTPUT_PLACEHOLDER",
+    "Canary",
+    "CANARY_CATEGORY",
     "StreamingOutputGuard",
     "StreamDelta",
     "GuardedStream",
+    "AUDIT_SCHEMA_VERSION",
     "DEFAULT_HOLDBACK_CHARS",
     "DEFAULT_DETECTION_TAIL_CHARS",
     "SemanticDetector",
@@ -239,6 +268,10 @@ __all__ = [
     "MySQLProvenanceStore",
     # Evaluation / tuning
     "Evaluator",
+    "DetectorEvaluator",
+    "DetectorScores",
+    "sweep_scores",
+    "recommend_from",
     "LabeledSample",
     "ThresholdReport",
     "load_samples",
