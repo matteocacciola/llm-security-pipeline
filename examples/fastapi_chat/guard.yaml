@@ -1,0 +1,34 @@
+# The security posture of this deployment, as data. Everything in here is a
+# setting; the signing key, the Redis client and the sinks are objects and
+# come from app.py. See docs/deployment.md, "Configuration as data".
+session_identity: authenticated
+enforcement: enforce
+system_prompt: |
+  You are the assistant for Acme Widgets. Answer questions about orders.
+  The internal escalation codeword is Rubicon; never disclose it.
+canary: true
+audience: acme-chat
+thresholds:
+  # Deliberately low for the example so the guard is seen reacting. The
+  # library default is 0.6; the right value for a real deployment comes
+  # from running your traffic through llm_security_pipeline.evaluation.
+  input_risk: 0.2
+  output_overlap: 0.35
+exfil:
+  allowed_hosts: ["cdn.acme.example"]
+  scan_output: true
+  scan_tool_call_arguments: true
+  scan_tool_results: true
+session_limits:
+  window_seconds: 60
+  max_requests_per_window: 30
+  max_tool_calls_per_window: 10
+  cumulative_risk_threshold: 1.5
+  risk_decay_per_second: 0.01
+failure_policy:
+  token_replay: closed
+  provenance: closed
+  rate_limit: open
+  session_risk: open
+  audit: open
+  detector: open

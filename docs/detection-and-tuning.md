@@ -198,6 +198,18 @@ incrementing — a shadow deployment that stops counting is not measuring
 the same system — but going over budget is recorded on
 `result.rate_limited` instead of raised.
 
+## Tracing
+
+Metrics say how much; a trace says where. Pass the application's own
+OpenTelemetry tracer (`SecurityPipeline(tracer=...)`, extra `tracing`)
+and every guard becomes a child span of the request — `pre_process`,
+`detectors` under it, `post_process`, `tool_call` with `tool_result` and
+the external scan under that, `pre_process_media`. Attributes carry the
+verdict (outcome, scores, matched pattern names) and go through the same
+identifier guard as metric labels, for the same reason. The library never
+creates a provider of its own: it would compete with the application's or
+export to nowhere. A tracer that raises is swallowed and logged once.
+
 ## Metrics
 
 Three things in this library produce numbers whose entire purpose is to be

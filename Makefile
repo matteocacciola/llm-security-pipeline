@@ -25,9 +25,17 @@ lint: ## Run the lint and type-check gates (same as CI).
 	uv run ruff check .; \
 	uv run mypy
 
+audit: ## Check every installed dependency against the OSV/PyPI advisory databases.
+	@uv sync --group dev --all-extras; \
+	uv run pip-audit --progress-spinner off
+
 format: ## Apply ruff's automatic fixes.
 	@uv sync --group dev --all-extras; \
 	uv run ruff check . --fix
+
+test-examples: ## Run the example services' own tests.
+	@uv sync --group dev --all-extras; \
+	uv run pytest examples/ -q
 
 test:  ## Run tests.
 	@uv sync --group dev --all-extras; \

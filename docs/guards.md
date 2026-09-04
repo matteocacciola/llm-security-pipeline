@@ -142,6 +142,20 @@ against the pipeline's `input_risk_threshold`, not a default of its own.
 `combined_risk_score` is what the decision was taken on, as on
 `PreProcessResult`.
 
+## System-prompt overlap, measured over distinctive tokens
+
+The overlap score is the fraction of the system prompt's *distinctive*
+tokens found in the output — everything the tokenizer finds minus function
+words (a small multilingual list) and one- and two-character fragments. A
+prompt written as ordinary prose is mostly "you", "are", "the", and a
+bag-of-words ratio against it fires on half the replies a model will ever
+produce. Names, terms and identifiers are what would only appear in a
+reply if the prompt had been reproduced, and they tend to survive
+paraphrase and translation, so this still catches partial leakage. A
+prompt with no distinctive tokens scores 0.0 rather than a meaningless
+ratio; the canary is the tool for that prompt. The streaming guard uses
+the same token set, so streamed and buffered scores agree.
+
 ## Streaming output
 
 `post_process` needs the finished response. Almost every deployed chat
@@ -194,6 +208,13 @@ reports `leaked_before_holdback=True`, which is a different incident from a
 clean block and is logged as one. Keep `holdback_chars` above the longest
 credential your patterns can match and it does not arise; the default
 clears every pattern shipped with the library.
+
+[The CPU cost is per chunk, not per character: every `feed` rescans the
+window (detection tail plus buffer), so a stream fed one token at a time
+costs roughly window-size times more than a buffered scan of the same
+text. Batch tokens into chunks of a few dozen characters before feeding;
+the hold-back already delays emission by more than that, so nothing is
+lost.
 
 [Shadow mode](detection-and-tuning.md#shadow-mode) changes neither content nor timing: the hold-back is switched
 off, chunks are forwarded exactly as they arrive, and `would_block` records

@@ -304,6 +304,29 @@ distribution."
   their documented error; streaming equals buffered for any text and any
   chunking.
 
+### Added — observability and robustness
+
+- **Example service** `examples/fastapi_chat/`: YAML config via
+  `PipelineConfig`, the planted system prompt sent to a (stub) model,
+  SSE streaming honouring the replace-on-block contract with a dedicated
+  event, a tool behind `authorized_tool_call` with its result wrapped as
+  data, `/metrics`, `/health`. Its tests run in CI (`make test-examples`).
+- **Supply chain**: every action pinned to a commit SHA resolved from
+  source (tag kept as a comment), Dependabot for actions and pip, PyPI
+  trusted publishing with `id-token: write` and no stored token, a tag/
+  version consistency check, a CycloneDX SBOM attached to each release,
+  `pip-audit` in CI and as `make audit`.
+- **Tracing** (`tracer=`, extra `tracing`): a span per guard under the
+  application's tracer, verdicts as attributes, identifiers refused.
+- **Performance gate** `tests/test_performance.py`: linearity of the
+  sanitizer, output guard and streaming guard; bounded cost on an
+  encoded-token flood. Marker `perf`.
+- **Overlap over distinctive tokens**: `system_prompt_overlap` now
+  ignores function words (multilingual list) and short fragments, so an
+  ordinary reply no longer overlaps a prosaic prompt; streamed and
+  buffered scores share the token set. Threshold semantics unchanged;
+  scores for prosaic prompts will be lower than before.
+
 ### Fixed — gaps found reviewing every input surface after the feature work
 
 - **Detectors did not run on media.** `pre_process_media` ran only the

@@ -118,6 +118,7 @@ from .services.streaming_guard import (
     StreamingOutputGuard,
 )
 from .metrics import MetricsSink, SafeMetricsSink
+from .tracing import SafeTracer, Tracer
 from .resilience import (
     AUDIT,
     OPERATIONS,
@@ -466,6 +467,7 @@ class SecurityPipeline:
         failure_policy: FailurePolicy | None = None,
         detectors: "list[Registration] | DetectorEnsemble | None" = None,
         metrics: MetricsSink | None = None,
+        tracer: Tracer | None = None,
         canary: "Canary | bool | None" = None,
         rate_limiter: SessionRateLimiter | None = None,
         audit_logger: AuditLogger | None = None,
@@ -544,6 +546,9 @@ class SecurityPipeline:
         # log: that one is per-request and keeps identifiers, this one is
         # aggregate and carries none. See metrics.py.
         self.metrics = SafeMetricsSink(metrics)
+        # Spans per guard, under the application's own tracer. Same rule
+        # as metrics for what may be an attribute: no identifiers.
+        self.tracer = SafeTracer(tracer)
 
         # One ResilientBackend shared by every guard, so the circuit
         # breakers and the degradation reporting see a single coherent
@@ -902,7 +907,9 @@ class SecurityPipeline:
         address — against which risk accumulates even when sessions rotate.
         It defaults to the principal when one is given.
         """
-        with self._collecting_degradations() as degraded:
+        with self._collecting_degradations() as degraded, self.tracer.span(
+            "pre_process", enforcement=self.enforcement,
+        ) as span:
             with self.metrics.timed("scan_duration_seconds", stage="input"):
                 try:
                     result = await self._pre_process(
@@ -922,7 +929,13 @@ class SecurityPipeline:
                     self.metrics.increment(
                         "blocks_total", stage="input", reason="rate_limit",
                     )
+                    span.set_attribute("outcome", "rate_limited")
                     raise
+            span.set_attribute("outcome", "blocked" if result.blocked else "allowed")
+            span.set_attribute("risk_score", result.sanitized.risk_score)
+            span.set_attribute("combined_risk_score", result.combined_risk_score)
+            span.set_attribute("matched_patterns", result.sanitized.matched_patterns)
+            span.set_attribute("degraded", [d.operation for d in result.degraded])
         self._record_input_metrics(result)
         return result
 
@@ -1050,7 +1063,13 @@ class SecurityPipeline:
         else:
             result = await scan_awaitable
 
-        ensemble = await detector_task if detector_task is not None else None
+        if detector_task is not None:
+            with self.tracer.span("detectors") as det_span:
+                ensemble = await detector_task
+                det_span.set_attribute("enforcing_score", ensemble.enforcing_score)
+                det_span.set_attribute("errors", list(ensemble.errors))
+        else:
+            ensemble = None
         combined_risk = (
             self.detectors.combine(result.risk_score, ensemble)
             if ensemble is not None
@@ -1127,6 +1146,17 @@ class SecurityPipeline:
         Leaving it off keeps the previous behaviour, where external content
         is scanned and audited but never charged to anyone.
         """
+        with self.tracer.span("pre_process_external") as span:
+            result = await self._pre_process_external(
+                content, source_id, threshold, session_id, principal, actor_id,
+            )
+            span.set_attribute("outcome", "blocked" if result.blocked else "allowed")
+            span.set_attribute("risk_score", result.risk_score)
+            return result
+
+    async def _pre_process_external(
+        self, content, source_id, threshold, session_id, principal, actor_id,
+    ) -> SanitizationResult:
         effective_threshold = threshold if threshold is not None else self.input_risk_threshold
         detector_task = (
             asyncio.ensure_future(self.detectors.score(content)) if self.detectors else None
@@ -1281,9 +1311,14 @@ class SecurityPipeline:
     # -- Output ---------------------------------------------------------
 
     async def post_process(self, model_output: str) -> PostProcessResult:
-        with self._collecting_degradations() as degraded:
+        with self._collecting_degradations() as degraded, self.tracer.span(
+            "post_process", enforcement=self.enforcement,
+        ) as span:
             with self.metrics.timed("scan_duration_seconds", stage="output"):
                 result = await self._post_process(model_output)
+            span.set_attribute("outcome", "blocked" if result.blocked else "allowed")
+            span.set_attribute("secret_categories", list(result.scan.secret_findings))
+            span.set_attribute("system_prompt_overlap_score", result.scan.system_prompt_overlap_score)
         result = dataclasses.replace(result, degraded=tuple(degraded))
         self._record_output_metrics(result, streamed=False)
         return result
@@ -1515,7 +1550,9 @@ class SecurityPipeline:
         """
         self._require_principal(principal, "pre_process_media")
         actor_id = actor_id or principal
-        result = await self.media_scanner.scan(payload, media_type=media_type, source_id=source_id)
+        with self.tracer.span("pre_process_media", media_type=media_type) as span:
+            result = await self.media_scanner.scan(payload, media_type=media_type, source_id=source_id)
+            span.set_attribute("extractors", [e.extractor for e in result.extractions])
 
         # Whatever the extractors recovered is text the model will read, so
         # it is as much a detector's business as a typed message is — more,
@@ -1586,6 +1623,15 @@ class SecurityPipeline:
         defence; this is the detection in front of it.
         """
         self._require_principal(principal, "authorized_tool_call")
+        with self.tracer.span("tool_call", action=action) as span:
+            return await self._authorized_tool_call(
+                token, action, func, *args, session_id=session_id, principal=principal,
+                _span=span, **kwargs,
+            )
+
+    async def _authorized_tool_call(
+        self, token, action, func, *args, session_id, principal, _span, **kwargs,
+    ):
         if session_id is not None:
             await self.check_tool_call_budget(session_id, principal)
         if self.scan_tool_call_arguments:
@@ -1650,5 +1696,7 @@ class SecurityPipeline:
         # What is being judged now is the result, which is a different event
         # with its own audit record, its own metric, and its own exception.
         if self.scan_tool_results:
-            await self._scan_tool_result(action, output, session_id, principal)
+            with self.tracer.span("tool_result", action=action):
+                await self._scan_tool_result(action, output, session_id, principal)
+        _span.set_attribute("outcome", "allowed")
         return output

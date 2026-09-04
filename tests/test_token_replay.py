@@ -11,8 +11,8 @@ supposed to provide the exact same guarantee, on different technology.
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ProcessPoolExecutor
 import secrets
+from concurrent.futures import ProcessPoolExecutor
 
 import pytest
 
@@ -99,10 +99,14 @@ _WORKERS = {
 async def test_single_use_token_redeemed_exactly_once_across_processes(backend_name):
     worker = _WORKERS[backend_name]
 
+    # An explicit key, because the workers rebuild a guard from it and the
+    # token names its key id: a guard with no key would sign under the
+    # process-local "ephemeral" id, which the workers' "default" id does
+    # not match, and every redemption would fail with UnknownKeyId.
     secret_key = secrets.token_bytes(32)
-    guard = ScopeGuard(secret_key=secret_key)  # secret_key shared explicitly with workers below
+    guard = ScopeGuard(secret_key=secret_key)
     token = guard.issue_token(agent_id="sales_bot", scopes=["read_crm"], ttl_seconds=30, max_uses=1)
-    secret_key_hex = secret_key.hex()  # test needs to share the key across processes
+    secret_key_hex = secret_key.hex()  # the workers need the same key
 
     loop = asyncio.get_running_loop()
     with ProcessPoolExecutor(max_workers=5) as pool:

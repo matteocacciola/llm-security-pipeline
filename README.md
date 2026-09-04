@@ -45,6 +45,11 @@ In a long-lived service, construct `SecurityPipeline` once at startup
 rather than per-request; `async with` in the example above is for
 demonstration. Call `await pipeline.aclose()` on shutdown.
 
+A complete, running service — YAML config, SSE streaming with the
+replace-on-block contract, a tool behind a scoped token, `/metrics`,
+`/health` — is in [`examples/fastapi_chat/`](examples/fastapi_chat/app.py);
+its tests run in CI so it cannot rot.
+
 That is the whole integration surface for the common case. The rest of
 this page says what it covers and where to read more; the details live in
 `docs/`.

@@ -60,6 +60,7 @@ from .output_guard import (
     _apply_spans,
     _Span,
     _tokenize,
+    distinctive_tokens,
 )
 
 # Long enough for every secret pattern shipped in config/patterns.json,
@@ -180,7 +181,9 @@ class StreamingOutputGuard:
         # Tokens seen so far, for the overlap ratio without re-tokenizing
         # the whole response on every chunk.
         self._out_tokens: set[str] = set()
-        self._sys_tokens = _tokenize(system_prompt) if system_prompt else set()
+        # Distinctive tokens only, so the streamed score matches the
+        # buffered one; see system_prompt_overlap.
+        self._sys_tokens = distinctive_tokens(system_prompt) if system_prompt else set()
 
         self._finished = False
         self._blocked = False

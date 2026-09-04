@@ -107,6 +107,7 @@ from .config import (
     ExfilConfig,
     ParallelismConfig,
 )
+from .tracing import SafeTracer, Tracer
 from .metrics import (
     MetricsSink,
     NullMetricsSink,
@@ -148,6 +149,9 @@ __all__ = [
     "PatternConfig",
     "ExfilConfig",
     "ParallelismConfig",
+    # Tracing
+    "SafeTracer",
+    "Tracer",
     # Metrics
     "MetricsSink",
     "NullMetricsSink",

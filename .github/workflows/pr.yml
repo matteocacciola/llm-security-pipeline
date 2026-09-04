@@ -26,6 +26,14 @@ jobs:
         run: |
           make lint
 
+      - name: Audit dependencies for known vulnerabilities
+        run: |
+          make audit
+
+      - name: Run the example service's tests
+        run: |
+          uv run pytest examples/ -q
+
   test:
     name: "Run Tests"
     runs-on: ubuntu-latest

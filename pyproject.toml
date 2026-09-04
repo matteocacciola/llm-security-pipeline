@@ -43,6 +43,9 @@ postgres = ["asyncpg>=0.29"]
 metrics = [
     "prometheus-client>=0.20",
 ]
+tracing = [
+    "opentelemetry-api>=1.25",
+]
 mysql = ["aiomysql>=0.2"]
 all = [
     "redis>=5.0",
@@ -50,6 +53,7 @@ all = [
     "asyncpg>=0.29",
     "aiomysql>=0.2",
     "prometheus-client>=0.20",
+    "opentelemetry-api>=1.25",
 ]
 
 [build-system]
@@ -92,6 +96,7 @@ select = ["E4", "E7", "E9", "F", "B", "S", "C4", "RUF100"]
 "src/llm_security_pipeline/resilience.py" = ["S105"]
 # Tests assert (S101) and carry fixture credentials by construction.
 "tests/*" = ["S101", "S105", "S106"]
+"examples/*/test_*.py" = ["S101"]
 
 [tool.mypy]
 python_version = "3.10"
@@ -117,6 +122,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "--cov=llm_security_pipeline --cov-report=term-missing --cov-report=xml:coverage.xml --cov-report=html:htmlcov"
 markers = [
+    "perf: performance regression gate (shape, not speed)",
     "integration: exercises a real shared-state backend and real OS processes",
     "redis: integration test requires a reachable Redis instance; skipped automatically otherwise",
     "redis_cluster: integration test requires a reachable cluster-enabled Redis; skipped automatically otherwise",
@@ -138,7 +144,13 @@ source = ["llm_security_pipeline"]
 
 [dependency-groups]
 dev = [
+    "fastapi>=0.110",
+    "httpx>=0.27",
     "hypothesis>=6.100",
+    "opentelemetry-api>=1.25",
+    "opentelemetry-sdk>=1.25",
+    "pip-audit>=2.7",
+    "pyyaml>=6.0",
     "mypy>=1.13",
     "prometheus-client>=0.20",
     "pymysql>=1.2.0",

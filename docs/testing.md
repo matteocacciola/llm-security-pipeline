@@ -126,6 +126,24 @@ currently 3); it is bumped whenever a field is added, renamed or changes
 meaning, so a consumer can branch on it instead of finding out when its
 parser breaks. The history is in `CHANGELOG.md`.
 
+`tests/test_performance.py` is a regression gate on *shape*, not speed:
+doubling the input must roughly double the time, because the failure worth
+catching is a pattern that turns a scanner quadratic, invisible at twenty
+characters and very visible at twenty thousand. It fails on a synthetic
+quadratic and passes on the real scanners; a loose absolute floor catches
+a scanner that became pathologically slow at every size. Run it alone with
+`pytest -m perf` when touching a pattern or a scanner.
+
+The example service under `examples/` has its own tests, run in CI: an
+example that no longer runs teaches the wrong integration.
+
+Supply chain: every GitHub Action is pinned to a commit SHA (the tag is a
+comment beside it, and Dependabot keeps both current), releases use PyPI
+trusted publishing with no stored token and refuse a tag that does not
+match `pyproject.toml`, an SBOM is attached to each release, and
+`make audit` (`pip-audit`, also in CI) checks every dependency against the
+advisory databases.
+
 Lint and type checking run as their own CI job and are reproducible
 locally with `make lint` (ruff + mypy, both configured in
 `pyproject.toml`). Ruff is deliberately configured as a bug-finding gate

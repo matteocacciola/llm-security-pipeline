@@ -128,17 +128,71 @@ def _tokenize(text: str) -> set[str]:
     return set(re.findall(r"\w+", text))
 
 
+# Words that carry no information about WHICH text they came from. A system
+# prompt written as ordinary prose is mostly these, and a bag-of-words
+# overlap against it fires on any ordinary reply: "you are a helpful
+# assistant" shares four of its five tokens with half the sentences the
+# model will ever produce. The overlap is measured over the tokens that
+# remain once these are removed — the names, terms and identifiers that
+# would only appear in the output if the prompt had been reproduced.
+# Multilingual because the patterns are; the list is deliberately small
+# (function words only), since every word removed here is a word that can
+# no longer count as evidence.
+_STOPWORDS: frozenset[str] = frozenset("""
+a about above after again against all am an and any are as at be because been before
+being below between both but by can could did do does doing down during each few for
+from further had has have having he her here hers herself him himself his how i if in
+into is it its itself just let me more most my myself no nor not now of off on once only
+or other our ours ourselves out over own same she should so some such than that the their
+theirs them themselves then there these they this those through to too under until up
+very was we were what when where which while who whom why will with would you your yours
+yourself yourselves never always please must may might shall also
+il lo la i gli le un uno una di a da in con su per tra fra e o ma se che chi cui non
+come dove quando anche ancora sempre mai molto poco più meno questo questa questi queste
+quello quella quelli quelle mi ti si ci vi ne è sono sei siamo siete era erano ho hai ha
+abbiamo avete hanno del della dei delle dello al alla ai alle allo dal dalla dai dalle
+nel nella nei nelle sul sulla sui sulle
+el los las un una unos unas de del a al en con por para y o pero si que quien como donde
+cuando también nunca siempre muy más menos este esta estos estas ese esa esos esas es son
+soy eres somos sois está están fue eran ha han he hemos
+le la les un une des du de au aux en dans sur pour par et ou mais si que qui dont où
+quand aussi jamais toujours très plus moins ce cette ces cet est sont suis es sommes êtes
+était étaient a ont ai avons avez
+der die das ein eine einer eines dem den des und oder aber wenn dass wer wie wo wann auch
+nie immer sehr mehr weniger dieser diese dieses ist sind bin bist seid war waren hat haben
+habe hast habt zu mit von für auf aus bei nach über unter vor nicht
+o a os as um uma uns umas de do da dos das em no na nos nas com por para e ou mas se que
+quem como onde quando também nunca sempre muito mais menos este esta estes estas esse essa
+é são sou és somos sois era eram tem têm tenho
+""".split())
+
+
+def distinctive_tokens(text: str) -> set[str]:
+    """The tokens worth counting: everything the tokenizer finds minus the
+    function words above, minus one- and two-character fragments, which
+    are mostly punctuation residue and pronouns the list did not cover."""
+    return {t for t in _tokenize(text) if t not in _STOPWORDS and len(t) > 2}
+
+
 def system_prompt_overlap(output_text: str, system_prompt: str) -> float:
-    """Return the fraction of system-prompt tokens that also appear in the
-    output. A high value is a strong signal of leakage, even partial or
-    translated (proper nouns, technical terms and config IDs tend to stay
-    identical even across a translation)."""
-    sys_tokens = _tokenize(system_prompt)
-    out_tokens = _tokenize(output_text)
+    """Fraction of the system prompt's DISTINCTIVE tokens that appear in
+    the output.
+
+    Distinctive means not a function word: the ratio is taken over the
+    names, terms and identifiers that would only show up in a reply if the
+    prompt had been reproduced, which is what "leak" means. Proper nouns
+    and config IDs tend to survive translation and paraphrase, so this
+    still catches partial and translated leakage — it just no longer
+    counts "you", "are" and "the" as evidence.
+
+    A prompt with no distinctive tokens at all cannot be measured this
+    way and scores 0.0; a canary is the tool for that prompt.
+    """
+    sys_tokens = distinctive_tokens(system_prompt)
     if not sys_tokens:
         return 0.0
-    overlap = len(sys_tokens & out_tokens) / len(sys_tokens)
-    return round(overlap, 3)
+    out_tokens = _tokenize(output_text)
+    return round(len(sys_tokens & out_tokens) / len(sys_tokens), 3)
 
 
 @dataclass
