@@ -103,6 +103,29 @@ deliberately *not* a setting, so a config file that gets committed does not
 become a key that gets committed. `pipeline.config_summary` gives the
 running posture back as data, for a startup log line or a health endpoint.
 
+## Where the audit log goes
+
+Four sinks share one record shape (`{"ts", "event", "data"}` with
+`schema_version` in `data`), so a consumer written against one reads any:
+
+- `StdoutAuditLogger` — demos.
+- `RedisStreamAuditLogger` — one ordered stream every pod appends to.
+- `FileAuditLogger(path, max_bytes, backup_count, fsync)` — JSON lines,
+  rotated by size. Use `{pid}` in the path: rotation is rename-and-reopen
+  and two processes renaming one file race, so one file per process is the
+  only shape that is correct without a lock. A folder of files is what
+  `tail -F` and log shippers are for.
+- `PythonLoggingAuditLogger` — through the standard `logging` module,
+  which is how audit events reach **OpenTelemetry**: attach the OTel SDK's
+  logging handler to `llm_security_pipeline.audit` and they flow where
+  the application's logs already go, with the event type and every field
+  as indexed attributes. The library never imports OTel for this.
+
+The audit log **keeps identifiers** — session, principal, document — by
+design; it is the record of what happened to whom. Treat whatever backend
+receives it as audit-grade, which is not what a metrics or tracing backend
+usually is.
+
 ## Budgets per tier
 
 `SessionLimits` is one set of numbers; a SaaS has several. Pass

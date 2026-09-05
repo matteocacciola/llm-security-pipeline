@@ -36,6 +36,8 @@ silently forgets would give false assurance.
 
 from __future__ import annotations
 
+import dataclasses
+
 import hashlib
 from dataclasses import dataclass, field
 
@@ -96,6 +98,11 @@ class IngestVerdict:
     content_hash: str
     scan: SanitizationResult
     reasons: tuple[str, ...] = ()
+    # In shadow mode `decision` is what was DONE (always accept, so the
+    # document is indexed and retrievable) and `would_decide` is what
+    # enforcement would have done. Equal to `decision` otherwise. Same
+    # shape as blocked/would_block on the request path.
+    would_decide: str = ""
 
     @property
     def accepted(self) -> bool:
@@ -228,6 +235,7 @@ class IngestGuard:
             content_hash=content_hash(content),
             scan=scan,
             reasons=tuple(reasons),
+            would_decide=decision,
         )
 
     # -- provenance ------------------------------------------------------
@@ -287,11 +295,23 @@ class IngestGuard:
         source_id: str,
         trust: str | None = None,
         record_rejected: bool = True,
+        shadow: bool = False,
     ) -> IngestVerdict:
-        """Evaluate and record the verdict against `document_id`."""
+        """Evaluate and record the verdict against `document_id`.
+
+        With `shadow=True` the real verdict is computed and reported in
+        `would_decide`, but the document is recorded as accepted: a dry
+        run of the ingest thresholds on a real corpus, the way shadow mode
+        is a dry run of the request thresholds on real traffic. Nothing is
+        quarantined, so the review queue stays empty and every document
+        stays retrievable; the audit log and metrics say what would have
+        happened. Turn it off before trusting the queue.
+        """
         verdict = self.evaluate(
             content, document_id=document_id, source_id=source_id, trust=trust,
         )
+        if shadow:
+            verdict = self.shadowed(verdict)
         store = self._require_store()
         if verdict.accepted or record_rejected:
             record = ProvenanceRecord(
@@ -307,6 +327,12 @@ class IngestGuard:
             # caller is told rather than left to index it.
             await self._resilience().run(PROVENANCE, lambda: store.record(record))
         return verdict
+
+    @staticmethod
+    def shadowed(verdict: IngestVerdict) -> IngestVerdict:
+        """The verdict as shadow mode records it: accepted, with what
+        enforcement would have done kept in `would_decide`."""
+        return dataclasses.replace(verdict, decision=ACCEPT, would_decide=verdict.decision)
 
     async def verify_retrieved(self, content: str, *, document_id: str) -> RetrievalVerdict:
         """Check retrieved content against the record made at ingest.

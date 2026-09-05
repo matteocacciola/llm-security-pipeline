@@ -78,6 +78,12 @@ put the result through `wrap_as_data` when you build the prompt.
 
 ## Non-text input (`MediaScanner`)
 
+Each extractor is bounded by `extractor_timeout_seconds` (30 s): one that
+hangs — an OCR model that never returns, a decoder in a loop on a crafted
+file — is reported in `extractor_errors` and the others still count. A
+synchronous extractor cannot be interrupted, so its thread keeps running
+after the timeout; the scan just stops waiting for it.
+
 Payloads over `max_payload_bytes` (32 MB) are refused before any extractor
 runs and reported `oversized`, for the reason the text scanners refuse
 oversized input: a partial scan reported clean is a bypass with an address.
@@ -171,6 +177,16 @@ pattern matching (a pure Cyrillic or Greek sentence is left alone; that is
 just Russian, or Greek), and the fold is itself a signal weighted like an
 encoded payload: nobody types a mixed-script word by accident.
 `SanitizationResult.homoglyph_hits` reports the count.
+
+## Ingest in shadow mode
+
+The pipeline's shadow mode now covers ingest. The real verdict is computed
+and reported in `IngestVerdict.would_decide`, audited and counted as
+`would_block_total{stage="ingest"}`, but the document is recorded as
+accepted: nothing is quarantined, every document stays retrievable, the
+review queue stays empty. A dry run of the ingest thresholds on a real
+corpus, the way shadow mode is a dry run of the request thresholds on real
+traffic. Turn it off before trusting the queue.
 
 ## Reviewing quarantined documents
 

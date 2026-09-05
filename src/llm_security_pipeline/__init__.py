@@ -110,6 +110,7 @@ from .config import (
     ExfilConfig,
     ParallelismConfig,
 )
+from .audit_sinks import FileAuditLogger, PythonLoggingAuditLogger
 from .tracing import SafeTracer, Tracer
 from .metrics import (
     MetricsSink,
@@ -152,6 +153,9 @@ __all__ = [
     "PatternConfig",
     "ExfilConfig",
     "ParallelismConfig",
+    # Audit sinks
+    "FileAuditLogger",
+    "PythonLoggingAuditLogger",
     # Tracing
     "SafeTracer",
     "Tracer",

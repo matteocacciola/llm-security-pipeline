@@ -105,6 +105,18 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     (f"{SRC}/sessions/stores.py",
      "        while events and events[0] <= cutoff:\n            events.popleft()",
      "        pass", "sliding window never slides"),
+    (f"{SRC}/services/ingest_guard.py",
+     "        if shadow:\n            verdict = self.shadowed(verdict)",
+     "        if False:\n            verdict = self.shadowed(verdict)", "ingest shadow mode enforces anyway"),
+    (f"{SRC}/contrib/langchain.py",
+     "            if scan.blocked:\n                continue", "            if False:\n                continue",
+     "langchain retriever keeps poisoned documents"),
+    (f"{SRC}/contrib/langchain.py",
+     "        if pre is not None and pre.blocked:\n            return ChatResult(",
+     "        if False:\n            return ChatResult(", "langchain model called on a blocked input"),
+    (f"{SRC}/services/media_guard.py",
+     "                return await asyncio.wait_for(run_unbounded(extractor), self.extractor_timeout_seconds)",
+     "                return await run_unbounded(extractor)", "extractor timeout not applied"),
 ]
 
 

@@ -304,6 +304,27 @@ distribution."
   their documented error; streaming equals buffered for any text and any
   chunking.
 
+### Added — loggers and integrations
+
+- **`FileAuditLogger`**: JSON lines, size rotation with backups, `{pid}`
+  path template (rotation is per process by design), optional `fsync`.
+- **`PythonLoggingAuditLogger`**: audit events through `logging`, with
+  event type and fields as record attributes — the bridge to
+  OpenTelemetry logs via the OTel SDK's logging handler. Verified against
+  the real SDK's in-memory exporter.
+- **LangChain integration** (`contrib.langchain`, extra `langchain`):
+  `GuardedChatModel` (a `BaseChatModel`), `guard_retriever`,
+  `guard_tool`; identity from `configurable`; tested against
+  langchain-core's fake chat model.
+- **Per-extractor timeout** in `MediaScanner`
+  (`extractor_timeout_seconds`, 30 s): a hanging extractor is an error on
+  the result, not a hung request.
+- **Ingest shadow mode**: `IngestVerdict.would_decide`; shadow records
+  accept, audits and counts what enforcement would have done; batch path
+  included.
+- `AUDIT_SCHEMA_VERSION` → 5: `ingest` gains `would_decide`.
+- Five new mutations in `tools/mutate.py` for the above.
+
 ### Added — mutation check of the security decisions
 
 - `tools/mutate.py` / `make mutate`: 25 targeted mutations (expiry,
@@ -344,7 +365,7 @@ distribution."
   re-recorded under another decision, or deleted) is removed when found
   rather than filtered forever.
 
-### Added — after block C
+### Added — after revocation, attenuation, etc.
 
 - **Redis Cluster verified.** A 3-master cluster was stood up and every
   test ran with zero skips (667). Two new `redis_cluster` tests pin the
@@ -361,7 +382,7 @@ distribution."
   `pipeline.health()`; a Hypothesis property that attenuation can only
   shrink.
 
-### Added — block C
+### Added — revocation, attenuation, confusables handling, tiered limits, reloadable keys, and health endpoint
 
 Every store change below is implemented on the in-memory, Redis,
 PostgreSQL and MySQL stores and tested against all three real backends.
@@ -396,7 +417,7 @@ PostgreSQL and MySQL stores and tested against all three real backends.
   `cross_tenant_identifier`, buffered or streamed.
 - `AUDIT_SCHEMA_VERSION` → 4: events `subject_revoked`, `ingest_review`.
 
-### Added — block B
+### Added — observability and robustness
 
 - **Example service** `examples/fastapi_chat/`: YAML config via
   `PipelineConfig`, the planted system prompt sent to a (stub) model,

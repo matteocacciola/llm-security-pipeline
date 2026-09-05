@@ -111,6 +111,15 @@ _PRINTABLE_RUN = re.compile(rb"[\x20-\x7e]{8,}")
 DEFAULT_MAX_PAYLOAD_BYTES = 32 * 1024 * 1024
 
 
+# Generous: OCR on a large scan legitimately takes seconds. A hang is not
+# "slow", it is "never", and this is what turns never into a reported error.
+DEFAULT_EXTRACTOR_TIMEOUT = 30.0
+
+
+class ExtractorTimeout(Exception):
+    """An extractor did not finish within the scanner's per-extractor bound."""
+
+
 class BinaryStringsExtractor:
     """Printable ASCII runs from the raw bytes — `strings(1)`, essentially.
 
@@ -268,7 +277,18 @@ class MediaScanner:
         threshold: float = 0.6,
         executor=None,
         max_payload_bytes: int | None = DEFAULT_MAX_PAYLOAD_BYTES,
+        extractor_timeout_seconds: float | None = DEFAULT_EXTRACTOR_TIMEOUT,
     ):
+        # One extractor hanging — an OCR model that never returns, a
+        # decoder in an infinite loop on a crafted file — used to hang the
+        # whole scan, and the request behind it. Each extractor is now
+        # bounded on its own; one that times out is reported in
+        # extractor_errors and the others still count. A synchronous
+        # extractor cannot be interrupted, so its thread keeps running
+        # after the timeout; the scan just stops waiting for it.
+        if extractor_timeout_seconds is not None and extractor_timeout_seconds <= 0:
+            raise ValueError("extractor_timeout_seconds must be positive, or None for no limit.")
+        self.extractor_timeout_seconds = extractor_timeout_seconds
         if max_payload_bytes is not None and max_payload_bytes <= 0:
             raise ValueError("max_payload_bytes must be positive, or None for no limit.")
         self.max_payload_bytes = max_payload_bytes
@@ -296,6 +316,14 @@ class MediaScanner:
         loop = asyncio.get_running_loop()
 
         async def run(extractor) -> list[ExtractedText]:
+            if self.extractor_timeout_seconds is None:
+                return await run_unbounded(extractor)
+            try:
+                return await asyncio.wait_for(run_unbounded(extractor), self.extractor_timeout_seconds)
+            except TimeoutError:
+                raise ExtractorTimeout(f"timed out after {self.extractor_timeout_seconds}s") from None
+
+        async def run_unbounded(extractor) -> list[ExtractedText]:
             # A synchronous extractor has no await point, so calling it
             # directly here would run it to completion on the event loop
             # thread — measured at ~110ms of total starvation for a 3MB

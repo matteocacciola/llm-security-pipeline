@@ -120,6 +120,7 @@ Read in this order the first time; dip in afterwards.
 | [Identity and capability tokens](docs/identity-and-tokens.md) | Where the identity boundary falls, binding tokens and session state to a principal, rotating the signing key without downtime. |
 | [The guards](docs/guards.md) | Ingestion-time scanning, non-text input, the canary, streaming output, side-channel exfiltration, invisible-codepoint smuggling. |
 | [Detection, tuning and measurement](docs/detection-and-tuning.md) | Extending the patterns, semantic detectors, choosing thresholds, shadow mode, metrics. |
+| [LangChain integration](docs/langchain.md) | `GuardedChatModel`, `guard_retriever`, `guard_tool`: the pipeline in front of and behind a chain, with per-request identity from the run config. |
 | [Testing](docs/testing.md) | What each test file checks and why, the backend integration tests, the lint and type gates, the audit schema version. |
 
 Also: [CHANGELOG.md](CHANGELOG.md) for what changed and why, and

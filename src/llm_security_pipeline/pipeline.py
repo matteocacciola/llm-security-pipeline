@@ -140,7 +140,7 @@ logger = logging.getLogger(__name__)
 # Stamped on every audit event. Bump it when a field is added, renamed or
 # changes meaning, so a consumer parsing the stream can branch on it instead
 # of discovering the change when its parser breaks. History in CHANGELOG.md.
-AUDIT_SCHEMA_VERSION = 4
+AUDIT_SCHEMA_VERSION = 5
 
 # Degradations collected for the request currently being handled. A
 # ContextVar rather than an attribute because one SecurityPipeline serves
@@ -1618,16 +1618,30 @@ class SecurityPipeline:
         earlier."""
         verdict = await self.ingest_guard.ingest(
             content, document_id=document_id, source_id=source_id, trust=trust,
+            shadow=self.enforcement == "shadow",
         )
+        await self._record_ingest(verdict)
+        return verdict
+
+    async def _record_ingest(self, verdict: IngestVerdict) -> None:
+        self.metrics.increment(
+            "requests_total", stage="ingest",
+            outcome=verdict.decision, enforcement=self.enforcement,
+        )
+        if verdict.would_decide != "accept":
+            self.metrics.increment(
+                "blocks_total" if verdict.decision != "accept" else "would_block_total",
+                stage="ingest", reason=verdict.would_decide,
+            )
         await self._audit("ingest", {
             "document_id": verdict.document_id,
             "source_id": verdict.source_id,
             "trust": verdict.trust,
             "decision": verdict.decision,
+            "would_decide": verdict.would_decide,
             "risk_score": verdict.risk_score,
             "reasons": list(verdict.reasons),
         })
-        return verdict
 
     async def ingest_batch(
         self, documents: list[tuple[str, str, str]], trust: str | None = None,
@@ -1672,6 +1686,8 @@ class SecurityPipeline:
                 for content, document_id, source_id in documents
             ])
 
+        if self.enforcement == "shadow":
+            verdicts = [self.ingest_guard.shadowed(v) for v in verdicts]
         if self.ingest_guard.provenance_store is not None:
             await asyncio.gather(*[
                 self.ingest_guard.provenance_store.record(ProvenanceRecord(
@@ -1681,14 +1697,7 @@ class SecurityPipeline:
                 ))
                 for v in verdicts
             ])
-        await asyncio.gather(*[
-            self._audit("ingest", {
-                "document_id": v.document_id, "source_id": v.source_id,
-                "trust": v.trust, "decision": v.decision,
-                "risk_score": v.risk_score, "reasons": list(v.reasons),
-            })
-            for v in verdicts
-        ])
+        await asyncio.gather(*[self._record_ingest(v) for v in verdicts])
         return list(verdicts)
 
     async def verify_retrieved(self, content: str, *, document_id: str) -> RetrievalVerdict:
