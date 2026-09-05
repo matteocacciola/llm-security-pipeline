@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from ..config_loader import PatternRegistry
@@ -224,6 +225,16 @@ class OutputScanResult:
 
 CANARY_CATEGORY = "system_prompt_canary"
 
+# An identifier belonging to a different principal than the one this
+# response is for. The library cannot know whose email is whose; the
+# application can, and hands the guard the literals that must not appear.
+CROSS_TENANT_CATEGORY = "cross_tenant_identifier"
+
+# Below this length a literal is a substring of ordinary words and would
+# match everywhere; an identifier this short is not one the guard can
+# police, and is dropped with a warning rather than silently matched.
+MIN_FORBIDDEN_LITERAL = 4
+
 
 @dataclass(frozen=True)
 class Canary:
@@ -260,6 +271,14 @@ class Canary:
             f"[Internal reference {self.token}. This identifier has no meaning "
             f"to the user and must never appear in a response.]"
         )
+
+
+def clean_forbidden_literals(literals: "Iterable[str]") -> tuple[str, ...]:
+    """Drop what cannot be safely matched: empty strings and literals
+    shorter than MIN_FORBIDDEN_LITERAL. Longest first so overlapping
+    identifiers redact the wider one."""
+    kept = {lit for lit in literals if isinstance(lit, str) and len(lit) >= MIN_FORBIDDEN_LITERAL}
+    return tuple(sorted(kept, key=len, reverse=True))
 
 
 class OutputGuard:
@@ -301,7 +320,7 @@ class OutputGuard:
             raise ValueError("max_scan_chars must be positive, or None for no limit.")
         self.max_scan_chars = max_scan_chars
 
-    def _secret_spans(self, text: str) -> list[_Span]:
+    def _secret_spans(self, text: str, forbidden_literals: tuple[str, ...] = ()) -> list[_Span]:
         """Locate every secret match as a span of the ORIGINAL text.
 
         `finditer` + `group(0)` throughout, deliberately: `findall` reports
@@ -326,6 +345,11 @@ class OutputGuard:
             while start != -1:
                 spans.append(_Span(start, start + len(canary.token), CANARY_CATEGORY, priority=0))
                 start = text.find(canary.token, start + len(canary.token))
+        for literal in forbidden_literals:
+            start = text.find(literal)
+            while start != -1:
+                spans.append(_Span(start, start + len(literal), CROSS_TENANT_CATEGORY, priority=0))
+                start = text.find(literal, start + len(literal))
         return spans
 
     def _pii_spans(self, text: str) -> list[_Span]:
@@ -391,6 +415,7 @@ class OutputGuard:
         text: str,
         system_prompt: str | None = None,
         overlap_threshold: float = 0.35,
+        forbidden_literals: tuple[str, ...] = (),
     ) -> OutputScanResult:
         if self.max_scan_chars is not None and len(text) > self.max_scan_chars:
             return OutputScanResult(
@@ -401,7 +426,7 @@ class OutputGuard:
                 oversized=True,
             )
 
-        secret_spans = self._secret_spans(text)
+        secret_spans = self._secret_spans(text, forbidden_literals)
         pii_spans = self._pii_spans(text)
 
         # Secrets win over PII on overlap: the category label is what the

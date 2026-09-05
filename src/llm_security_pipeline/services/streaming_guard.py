@@ -147,7 +147,11 @@ class StreamingOutputGuard:
         max_output_chars: int | None = DEFAULT_MAX_SCAN_CHARS,
         redact_pii: bool = True,
         detection_tail_chars: int | None = None,
+        forbidden_literals: tuple[str, ...] = (),
     ):
+        # Identifiers of other principals: matched as secrets, so they
+        # block, and redacted through the same span path.
+        self.forbidden_literals = forbidden_literals
         if holdback_chars < 0:
             raise ValueError("holdback_chars cannot be negative.")
         if detection_tail_chars is not None and detection_tail_chars < 0:
@@ -290,7 +294,7 @@ class StreamingOutputGuard:
         offset = len(self._emitted_tail)
         window = self._emitted_tail + self._buffer
 
-        secret_spans = self.output_guard._secret_spans(window)
+        secret_spans = self.output_guard._secret_spans(window, self.forbidden_literals)
         pii_spans = self.output_guard._pii_spans(window) if self.redact_pii else []
         url_findings = self.exfil_guard.find_urls(window) if self.exfil_guard is not None else []
 

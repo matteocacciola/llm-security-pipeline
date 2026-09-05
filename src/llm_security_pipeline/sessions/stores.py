@@ -21,6 +21,7 @@ where a single Python process handles all traffic.
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from abc import ABC, abstractmethod
 from typing import NamedTuple
@@ -33,14 +34,32 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 
 class NonceStore(ABC):
-    """Tracks how many times a capability token's nonce has been consumed,
-    atomically, so max_uses / anti-replay holds across processes."""
+    """Token bookkeeping shared across processes: use counts per nonce,
+    and revocations per subject.
+
+    Revocation lives here rather than in a store of its own because it is
+    the same question the nonce answers — "may this token still be spent?"
+    — asked about a person instead of a token. A revoked subject's tokens
+    issued at or before the revocation instant are refused whatever their
+    TTL; the record itself expires after `ttl_seconds`, which must exceed
+    the longest token TTL the deployment issues, or a token could outlive
+    the revocation that was meant to kill it.
+    """
 
     @abstractmethod
     async def check_and_increment(self, nonce: str, max_uses: int, ttl_seconds: int) -> int:
         """Atomically increment the usage counter for `nonce` and return the
         new count. Callers compare the returned count to `max_uses`
         themselves so the store stays a simple counter primitive."""
+
+    @abstractmethod
+    async def revoke_subject(self, subject: str, revoked_at: float, ttl_seconds: int) -> None:
+        """Refuse every token of `subject` issued at or before `revoked_at`.
+        Revoking again never moves the instant backwards."""
+
+    @abstractmethod
+    async def revoked_at(self, subject: str) -> float | None:
+        """When `subject` was revoked, or None if not (or the record expired)."""
 
 
 class InMemoryNonceStore(NonceStore):
@@ -54,6 +73,27 @@ class InMemoryNonceStore(NonceStore):
         # thread, since there is no `await` between read and write here.
         self._counts[nonce] = self._counts.get(nonce, 0) + 1
         return self._counts[nonce]
+
+    _revocations: dict[str, tuple[float, float]] | None = None  # subject -> (revoked_at, expires_at)
+
+    async def revoke_subject(self, subject: str, revoked_at: float, ttl_seconds: int) -> None:
+        if self._revocations is None:
+            self._revocations = {}
+        previous = self._revocations.get(subject)
+        at = max(revoked_at, previous[0]) if previous else revoked_at
+        self._revocations[subject] = (at, time.time() + ttl_seconds)
+
+    async def revoked_at(self, subject: str) -> float | None:
+        if not self._revocations:
+            return None
+        entry = self._revocations.get(subject)
+        if entry is None:
+            return None
+        at, expires = entry
+        if expires <= time.time():
+            del self._revocations[subject]
+            return None
+        return at
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +338,16 @@ class ProvenanceStore(ABC):
     async def delete(self, document_id: str) -> None:
         ...
 
+    @abstractmethod
+    async def list_by_decision(self, decision: str, limit: int = 100) -> list[ProvenanceRecord]:
+        """Records with this decision, oldest first — the review queue when
+        the decision is "quarantine"."""
+
+    @abstractmethod
+    async def set_decision(self, document_id: str, decision: str) -> bool:
+        """Overwrite a record's decision (a reviewer approving or rejecting
+        a quarantined document). False if there is no such record."""
+
 
 class InMemoryProvenanceStore(ProvenanceStore):
     """Single-process implementation for local development and unit tests."""
@@ -313,3 +363,14 @@ class InMemoryProvenanceStore(ProvenanceStore):
 
     async def delete(self, document_id: str) -> None:
         self._records.pop(document_id, None)
+
+    async def list_by_decision(self, decision: str, limit: int = 100) -> list[ProvenanceRecord]:
+        matching = [r for r in self._records.values() if r.decision == decision]
+        return sorted(matching, key=lambda r: r.recorded_at)[:limit]
+
+    async def set_decision(self, document_id: str, decision: str) -> bool:
+        record = self._records.get(document_id)
+        if record is None:
+            return False
+        self._records[document_id] = dataclasses.replace(record, decision=decision)
+        return True

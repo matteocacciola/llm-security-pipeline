@@ -80,6 +80,13 @@ _DDL_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS sentinel_revocations (
+        subject     VARCHAR(255) PRIMARY KEY,
+        revoked_at  DOUBLE NOT NULL,
+        expires_at  DOUBLE NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS sentinel_risk (
         session_id  VARCHAR(255) PRIMARY KEY,
         risk        DOUBLE NOT NULL,
@@ -99,7 +106,8 @@ _DDL_STATEMENTS = [
         trust        VARCHAR(32) NOT NULL,
         decision     VARCHAR(32) NOT NULL,
         risk_score   DOUBLE NOT NULL,
-        recorded_at  DOUBLE NOT NULL
+        recorded_at  DOUBLE NOT NULL,
+        INDEX sentinel_provenance_decision (decision, recorded_at)
     )
     """,
 ]
@@ -180,6 +188,35 @@ class MySQLNonceStore(NonceStore):
         self._pool = pool
         self._cleanup = _OpportunisticCleanup(cleanup_interval_seconds)
 
+    async def revoke_subject(self, subject: str, revoked_at: float, ttl_seconds: int) -> None:
+        async with self._pool.acquire() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO sentinel_revocations (subject, revoked_at, expires_at)
+                        VALUES (%s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            revoked_at = GREATEST(revoked_at, VALUES(revoked_at)),
+                            expires_at = VALUES(expires_at)
+                        """,
+                        (subject, revoked_at, time.time() + ttl_seconds),
+                    )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def revoked_at(self, subject: str) -> float | None:
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT revoked_at FROM sentinel_revocations WHERE subject = %s AND expires_at > %s",
+                    (subject, time.time()),
+                )
+                row = await cur.fetchone()
+        return None if row is None else float(row[0])
+
     async def check_and_increment(self, nonce: str, max_uses: int, ttl_seconds: int) -> int:
         return await _with_deadlock_retry(
             lambda: self._check_and_increment_once(nonce, ttl_seconds)
@@ -192,6 +229,7 @@ class MySQLNonceStore(NonceStore):
                 async with conn.cursor() as cur:
                     if self._cleanup.due():
                         await cur.execute("DELETE FROM sentinel_nonces WHERE expires_at < %s", (now,))
+                        await cur.execute("DELETE FROM sentinel_revocations WHERE expires_at < %s", (now,))
                     # Single atomic upsert; LAST_INSERT_ID(expr) records the
                     # updated counter on this connection so it can be read back
                     # without a second locking read. Expired rows logically
@@ -427,3 +465,38 @@ class MySQLProvenanceStore(ProvenanceStore):
                     "DELETE FROM sentinel_provenance WHERE document_id = %s", (document_id,),
                 )
             await conn.commit()
+
+    async def list_by_decision(self, decision: str, limit: int = 100) -> list[ProvenanceRecord]:
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT document_id, content_hash, source_id, trust, decision, risk_score, recorded_at
+                    FROM sentinel_provenance WHERE decision = %s
+                    ORDER BY recorded_at ASC LIMIT %s
+                    """,
+                    (decision, int(limit)),
+                )
+                rows = await cur.fetchall()
+        return [
+            ProvenanceRecord(
+                document_id=r[0], content_hash=r[1], source_id=r[2], trust=r[3],
+                decision=r[4], risk_score=float(r[5]), recorded_at=float(r[6]),
+            )
+            for r in rows
+        ]
+
+    async def set_decision(self, document_id: str, decision: str) -> bool:
+        async with self._pool.acquire() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE sentinel_provenance SET decision = %s WHERE document_id = %s",
+                        (decision, document_id),
+                    )
+                    updated = cur.rowcount
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return updated > 0

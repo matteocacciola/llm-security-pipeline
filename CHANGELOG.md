@@ -304,6 +304,41 @@ distribution."
   their documented error; streaming equals buffered for any text and any
   chunking.
 
+### Added — revocation, attenuation, confusables handling, tiered limits, reloadable keys, and health endpoint
+
+Every store change below is implemented on the in-memory, Redis,
+PostgreSQL and MySQL stores and tested against all three real backends.
+
+- **Subject revocation** (`revoke_subject`, `NonceStore.revoke_subject`/
+  `revoked_at`): tokens issued at or before the instant are refused, before
+  the nonce is spent; fail-closed on the write; new `sentinel_revocations`
+  table on SQL, `revoked:<subject>` key on Redis. Audited as
+  `subject_revoked`.
+- **Attenuation** (`attenuate`): derive a narrower token — subset of
+  scopes, no later expiry, at most as many uses, constraints only added,
+  subject and audience inherited — with `parent` and `depth` (capped at
+  `MAX_DELEGATION_DEPTH`) in the signed payload.
+- **Confusable folding** inside mixed-script words before pattern
+  matching, reported as `mixed_script_homoglyphs` and weighted by
+  `RiskWeights.homoglyphs`; `SanitizationResult.homoglyph_hits`.
+- **Per-tier budgets** (`limits_for=`), threaded through request and
+  tool-call budgets and risk thresholds.
+- **Reloadable keyring** (`keyring_provider=` / `scope_keyring_provider=`,
+  `reload_keys()`): rotation without a restart; a failing provider keeps
+  the last good keyring and is logged once.
+- **`health()`**: store probes under a timeout, open breakers across every
+  guard (a caller-supplied guard's breakers were previously invisible —
+  found and fixed while testing), and the posture.
+- **Review queue** (`review_queue`, `approve_document`, `reject_document`;
+  `ProvenanceStore.list_by_decision`/`set_decision`): a decision written
+  over the provenance record, seen by the next retrieval. Redis keeps a
+  per-decision sorted-set index; SQL gains an index on
+  `(decision, recorded_at)`. Audited as `ingest_review`.
+- **Cross-tenant identifiers** (`foreign_identifiers=`, `principal=` on
+  `post_process` and `guard_stream`): matched as the secret category
+  `cross_tenant_identifier`, buffered or streamed.
+- `AUDIT_SCHEMA_VERSION` → 4: events `subject_revoked`, `ingest_review`.
+
 ### Added — observability and robustness
 
 - **Example service** `examples/fastapi_chat/`: YAML config via

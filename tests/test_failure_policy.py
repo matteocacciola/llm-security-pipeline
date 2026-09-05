@@ -71,6 +71,12 @@ class DeadNonceStore(NonceStore):
     async def check_and_increment(self, nonce, max_uses, ttl_seconds):
         raise Boom("connection refused")
 
+    async def revoke_subject(self, subject, revoked_at, ttl_seconds):
+        raise Boom("connection refused")
+
+    async def revoked_at(self, subject):
+        raise Boom("connection refused")
+
 
 class HangingNonceStore(NonceStore):
     """Worse than dead: it never answers at all."""
@@ -78,6 +84,13 @@ class HangingNonceStore(NonceStore):
     async def check_and_increment(self, nonce, max_uses, ttl_seconds):
         await asyncio.sleep(30)
         return 1
+
+    async def revoke_subject(self, subject, revoked_at, ttl_seconds):
+        await asyncio.sleep(30)
+
+    async def revoked_at(self, subject):
+        await asyncio.sleep(30)
+        return None
 
 
 class CollectingAudit(AuditLogger):

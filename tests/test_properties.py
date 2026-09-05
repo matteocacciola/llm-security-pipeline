@@ -95,6 +95,19 @@ def test_hidden_text_and_encoded_payload_finders_never_raise(text):
 
 
 @BUDGET
+@given(sneaky_text)
+def test_confusable_folding_is_total_and_idempotent(text):
+    """Any text; folding twice folds nothing more; single-script words are
+    left byte-identical."""
+    from llm_security_pipeline.services.sanitizer import fold_confusables
+
+    once, hits = fold_confusables(text)
+    twice, more = fold_confusables(once)
+    assert hits >= 0 and more == 0 and twice == once
+    assert len(once) == len(text)   # one letter maps to one letter
+
+
+@BUDGET
 @given(any_text)
 def test_the_output_guard_never_raises_and_never_leaves_a_finding(text):
     guard = OutputGuard(max_scan_chars=None)

@@ -103,6 +103,22 @@ deliberately *not* a setting, so a config file that gets committed does not
 become a key that gets committed. `pipeline.config_summary` gives the
 running posture back as data, for a startup log line or a health endpoint.
 
+## Budgets per tier
+
+`SessionLimits` is one set of numbers; a SaaS has several. Pass
+`limits_for=` — called with the principal (or `None`) once per request,
+returning the `SessionLimits` to use or `None` for the defaults — and the
+request budget, tool-call budget and risk thresholds follow the caller's
+plan without a pipeline per plan.
+
+## Health
+
+`await pipeline.health()` probes every configured store with one cheap
+read under a timeout, reports which circuit breakers are open (across
+every guard, including ones you supplied), and returns the running posture
+from `config_summary`. Never raises; `status` is `"ok"` or `"degraded"`,
+the same word the failure policy uses because it means the same thing.
+
 ## How the session budget counts
 
 Request and tool-call budgets are **sliding windows**, not fixed ones.

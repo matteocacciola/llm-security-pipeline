@@ -142,6 +142,41 @@ against the pipeline's `input_risk_threshold`, not a default of its own.
 `combined_risk_score` is what the decision was taken on, as on
 `PreProcessResult`.
 
+## Cross-tenant identifiers in the output
+
+The library cannot know whose email is whose; the application can. Pass
+`foreign_identifiers=` — given the principal a response is for, return the
+identifiers (emails, account numbers, names) that belong to *other*
+principals — and give `post_process` and `guard_stream` the `principal`.
+Anything returned is matched as a secret category
+(`cross_tenant_identifier`), so it blocks and redacts through the same path
+a credential does, buffered or streamed. The resolver may be sync or
+async. Literals shorter than four characters are dropped: an identifier
+that short is a substring of ordinary words, not something a guard can
+police.
+
+## Mixed-script homoglyphs
+
+`ignоre` with a Cyrillic о matches no English pattern and reads identically
+to a person. NFKC does not fold it, and should not: they are different
+letters. What is detectable is the *mix* — a word that is Latin except for
+one or two letters from another script is not a word in any language. So
+script-confusable letters are folded only inside mixed-script words before
+pattern matching (a pure Cyrillic or Greek sentence is left alone; that is
+just Russian, or Greek), and the fold is itself a signal weighted like an
+encoded payload: nobody types a mixed-script word by accident.
+`SanitizationResult.homoglyph_hits` reports the count.
+
+## Reviewing quarantined documents
+
+"Quarantine" used to be a verdict with nowhere to go. `review_queue()`
+lists quarantined documents oldest first; `approve_document(id)` and
+`reject_document(id)` write the decision over the provenance record, so
+the next `verify_retrieved` sees it — approving is what makes a document
+retrievable. Both are audited as `ingest_review`. Backed by the provenance
+store on every backend; Redis keeps a per-decision sorted set so the queue
+does not scan every record.
+
 ## System-prompt overlap, measured over distinctive tokens
 
 The overlap score is the fraction of the system prompt's *distinctive*

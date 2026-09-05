@@ -76,6 +76,13 @@ this page says what it covers and where to read more; the details live in
 
 - Rotating the token signing key without a window in which valid tokens
   are rejected
+- Revoking every token a subject holds, and delegating with tokens that
+  can only shrink
+- Rotating the signing key without a restart, reviewing quarantined
+  documents, budgets per tier, and a health endpoint that knows which
+  breakers are open
+- Homoglyph attacks (`ignоre` with a Cyrillic о) and another tenant's
+  identifiers appearing in a reply
 - Measuring all of the above — shadow-mode deltas, score distributions,
   detector calibration — as aggregate metrics with no identifiers in them
 - Plugging in a model-based detector to cover the paraphrase gap the

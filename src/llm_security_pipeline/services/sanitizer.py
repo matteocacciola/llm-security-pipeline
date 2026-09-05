@@ -97,6 +97,69 @@ def find_hidden_text(text: str, min_len: int = 3) -> list[str]:
     return [decoded] if len(decoded) >= min_len else []
 
 
+# ---------------------------------------------------------------------------
+# Confusables
+# ---------------------------------------------------------------------------
+# "ignоre" with a Cyrillic о (U+043E) matches no English pattern and reads
+# identically to a human. NFKC does not fold it: these are distinct letters
+# in distinct scripts, and Unicode is right not to conflate them. What
+# makes the case detectable is not the letter but the MIX: a word that is
+# Latin except for one or two letters from another script is not a word in
+# any language. So confusables are folded only inside mixed-script words,
+# a pure-Cyrillic or pure-Greek word is left alone (that is just Russian,
+# or Greek), and the fold itself is reported as a signal — nobody types a
+# mixed-script word by accident.
+#
+# The table covers the letters that are visually identical across Cyrillic,
+# Greek and Latin in common fonts. It is a subset of Unicode's confusables
+# data on purpose: every mapping here is one a person would not notice.
+
+_CONFUSABLES: dict[str, str] = {
+    # Cyrillic -> Latin
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x",
+    "і": "i", "ј": "j", "ѕ": "s", "һ": "h", "ԁ": "d", "ԛ": "q", "ԝ": "w",
+    "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O",
+    "Р": "P", "С": "C", "Т": "T", "Х": "X", "І": "I", "Ј": "J", "Ѕ": "S",
+    # Greek -> Latin
+    "ο": "o", "α": "a", "ν": "v", "ρ": "p", "τ": "t", "ι": "i", "κ": "k",
+    "υ": "u", "ε": "e", "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H",
+    "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O", "Ρ": "P", "Τ": "T",
+    "Υ": "Y", "Χ": "X",
+}
+_LATIN_LETTER = re.compile(r"[A-Za-z]")
+_WORD = re.compile(r"\w+", re.UNICODE)
+
+
+def fold_confusables(text: str) -> tuple[str, int]:
+    """Fold script-confusable letters inside mixed-script words.
+
+    Returns the folded text and how many letters were folded. Words made
+    entirely of one script are untouched: the signal is the mix, and
+    folding a whole Cyrillic sentence into Latin gibberish would be both
+    wrong and a false positive on every Russian message.
+    """
+    folded = 0
+
+    def fix(match: "re.Match[str]") -> str:
+        word = match.group(0)
+        if not _LATIN_LETTER.search(word):
+            return word
+        if not any(ch in _CONFUSABLES for ch in word):
+            return word
+        nonlocal folded
+        out = []
+        for ch in word:
+            rep = _CONFUSABLES.get(ch)
+            if rep is not None:
+                folded += 1
+                out.append(rep)
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    return _WORD.sub(fix, text), folded
+
+
 def normalize_text(text: str) -> str:
     """Normalize text to neutralize Unicode obfuscation tricks (homoglyphs,
     fullwidth characters, zero-width joiners, tag-block smuggling,
@@ -191,6 +254,10 @@ class RiskWeights:
     hidden_text: float = 0.4
     bidi_override: float = 0.2
     multiple_languages: float = 0.15
+    # A mixed-script word is not a word in any language; it exists to look
+    # like one to a human and not to a pattern. Weighted like an encoded
+    # payload, for the same reason: it is hostile by construction.
+    homoglyphs: float = 0.4
 
 
 DEFAULT_RISK_WEIGHTS = RiskWeights()
@@ -212,6 +279,8 @@ class SanitizationResult:
     # instead of scanned. See DEFAULT_MAX_SCAN_CHARS for why a refusal beats
     # scanning a prefix.
     oversized: bool = False
+    # Letters folded from a confusable script inside mixed-script words.
+    homoglyph_hits: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +354,10 @@ class Sanitizer:
         hidden_hits = find_hidden_text(text)
         has_bidi_override = bool(_BIDI_OVERRIDES.search(text))
 
-        normalized = normalize_text(text)
+        # Fold before matching, so "ignоre" (Cyrillic о) hits the same
+        # pattern "ignore" does. The fold count is a signal in itself.
+        folded_text, homoglyph_hits = fold_confusables(text)
+        normalized = normalize_text(folded_text)
         injection_patterns = self.registry.injection_patterns
 
         matched_patterns: list[str] = []
@@ -334,6 +406,9 @@ class Sanitizer:
             score += weights.hidden_text
         if has_bidi_override:
             score += weights.bidi_override
+        if homoglyph_hits:
+            score += weights.homoglyphs
+            matched_patterns.append("mixed_script_homoglyphs")
         if len(matched_languages) > 1:
             score += weights.multiple_languages  # suspicious code-mixing signal
         score = min(score, 1.0)
@@ -347,6 +422,7 @@ class Sanitizer:
             matched_languages=matched_languages,
             decoded_payload_hits=decoded_hits,
             hidden_text_hits=hidden_hits,
+            homoglyph_hits=homoglyph_hits,
             blocked=score >= threshold,
             source_id=source_id,
         )

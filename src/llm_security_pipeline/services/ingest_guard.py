@@ -237,6 +237,37 @@ class IngestGuard:
             raise RuntimeError("IngestGuard was constructed without running __post_init__.")
         return self.resilience
 
+    # -- review queue ----------------------------------------------------
+    # "Quarantine" was a verdict with nowhere to go: the record said a
+    # human should look, and nothing let the human look, decide, or make
+    # the decision stick. These are that. A decision made here is written
+    # over the provenance record, so verify_retrieved sees it on the next
+    # retrieval — approving a document is what makes it retrievable.
+
+    async def review_queue(self, limit: int = 100) -> list[ProvenanceRecord]:
+        """Quarantined documents, oldest first."""
+        store = self._require_store()
+        result = await self._resilience().run(
+            PROVENANCE, lambda: store.list_by_decision(QUARANTINE, limit),
+        )
+        return [] if isinstance(result, Degraded) else result
+
+    async def approve(self, document_id: str) -> bool:
+        """A reviewer read it and it is fine: retrievable from now on."""
+        return await self._decide(document_id, ACCEPT)
+
+    async def reject(self, document_id: str) -> bool:
+        """A reviewer read it and it is not: stays in the index if you
+        leave it there, but never verifies at retrieval."""
+        return await self._decide(document_id, REJECT)
+
+    async def _decide(self, document_id: str, decision: str) -> bool:
+        store = self._require_store()
+        result = await self._resilience().run(
+            PROVENANCE, lambda: store.set_decision(document_id, decision),
+        )
+        return False if isinstance(result, Degraded) else bool(result)
+
     def _require_store(self) -> ProvenanceStore:
         if self.provenance_store is None:
             raise RuntimeError(

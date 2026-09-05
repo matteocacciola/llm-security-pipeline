@@ -20,6 +20,8 @@ from .scope_guard import (
     DEFAULT_KEY_ID,
     MAX_TOKEN_CHARS,
     MIN_KEY_BYTES,
+    DEFAULT_REVOCATION_TTL,
+    MAX_DELEGATION_DEPTH,
 )
 from .exfil_guard import (
     ExfilGuard,
@@ -99,6 +101,8 @@ __all__ = [
     "DEFAULT_KEY_ID",
     "MAX_TOKEN_CHARS",
     "MIN_KEY_BYTES",
+    "DEFAULT_REVOCATION_TTL",
+    "MAX_DELEGATION_DEPTH",
     "ExfilGuard",
     "ExfilPolicy",
     "ExfilScanResult",

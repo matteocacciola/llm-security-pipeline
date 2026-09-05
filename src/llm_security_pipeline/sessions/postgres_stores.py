@@ -78,6 +78,12 @@ CREATE TABLE IF NOT EXISTS sentinel_risk (
 -- table here it is not a counter with a TTL. A record has to outlive
 -- whatever session retrieved the document, and an expired record is
 -- indistinguishable from a document that was never scanned at all.
+CREATE TABLE IF NOT EXISTS sentinel_revocations (
+    subject     TEXT PRIMARY KEY,
+    revoked_at  DOUBLE PRECISION NOT NULL,
+    expires_at  DOUBLE PRECISION NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sentinel_provenance (
     document_id  TEXT PRIMARY KEY,
     content_hash TEXT NOT NULL,
@@ -87,6 +93,7 @@ CREATE TABLE IF NOT EXISTS sentinel_provenance (
     risk_score   DOUBLE PRECISION NOT NULL,
     recorded_at  DOUBLE PRECISION NOT NULL
 );
+CREATE INDEX IF NOT EXISTS sentinel_provenance_decision ON sentinel_provenance (decision, recorded_at);
 """
 
 
@@ -124,6 +131,27 @@ class _OpportunisticCleanup:
 
 
 class PostgresNonceStore(NonceStore):
+    async def revoke_subject(self, subject: str, revoked_at: float, ttl_seconds: int) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO sentinel_revocations (subject, revoked_at, expires_at)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (subject) DO UPDATE SET
+                    revoked_at = GREATEST(sentinel_revocations.revoked_at, EXCLUDED.revoked_at),
+                    expires_at = EXCLUDED.expires_at
+                """,
+                subject, revoked_at, time.time() + ttl_seconds,
+            )
+
+    async def revoked_at(self, subject: str) -> float | None:
+        async with self._pool.acquire() as conn:
+            value = await conn.fetchval(
+                "SELECT revoked_at FROM sentinel_revocations WHERE subject = $1 AND expires_at > $2",
+                subject, time.time(),
+            )
+        return None if value is None else float(value)
+
     def __init__(self, pool: "asyncpg.Pool", cleanup_interval_seconds: float = 60.0):
         _require_asyncpg()
         self._pool = pool
@@ -134,6 +162,7 @@ class PostgresNonceStore(NonceStore):
         async with self._pool.acquire() as conn:
             if self._cleanup.due():
                 await conn.execute("DELETE FROM sentinel_nonces WHERE expires_at < $1", now)
+                await conn.execute("DELETE FROM sentinel_revocations WHERE expires_at < $1", now)
             # Single atomic statement: insert first use, or increment.
             # An expired row is logically reset to a fresh first use — the
             # nonce's own TTL matches the token's, so an expired row can
@@ -312,3 +341,30 @@ class PostgresProvenanceStore(ProvenanceStore):
     async def delete(self, document_id: str) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute("DELETE FROM sentinel_provenance WHERE document_id = $1", document_id)
+
+    async def list_by_decision(self, decision: str, limit: int = 100) -> list[ProvenanceRecord]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT document_id, content_hash, source_id, trust, decision, risk_score, recorded_at
+                FROM sentinel_provenance WHERE decision = $1
+                ORDER BY recorded_at ASC LIMIT $2
+                """,
+                decision, limit,
+            )
+        return [
+            ProvenanceRecord(
+                document_id=r["document_id"], content_hash=r["content_hash"], source_id=r["source_id"],
+                trust=r["trust"], decision=r["decision"], risk_score=float(r["risk_score"]),
+                recorded_at=float(r["recorded_at"]),
+            )
+            for r in rows
+        ]
+
+    async def set_decision(self, document_id: str, decision: str) -> bool:
+        async with self._pool.acquire() as conn:
+            updated = await conn.fetchval(
+                "UPDATE sentinel_provenance SET decision = $2 WHERE document_id = $1 RETURNING document_id",
+                document_id, decision,
+            )
+        return updated is not None

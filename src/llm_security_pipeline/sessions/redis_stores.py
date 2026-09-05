@@ -105,6 +105,12 @@ def _require_redis() -> None:
         )
 
 
+def _text(value: "str | bytes") -> str:
+    """redis-py returns bytes unless the client was built with
+    decode_responses=True; both must work."""
+    return value.decode() if isinstance(value, bytes) else value
+
+
 class RedisNonceStore(NonceStore):
     """Nonce keys are deliberately left untagged.
 
@@ -121,6 +127,20 @@ class RedisNonceStore(NonceStore):
         self._redis = redis_client
         self._key_prefix = key_prefix
         self._script = self._redis.register_script(_INCR_WITH_TTL_SCRIPT)
+
+    def _revocation_key(self, subject: str) -> str:
+        return f"{self._key_prefix}revoked:{subject}"
+
+    async def revoke_subject(self, subject: str, revoked_at: float, ttl_seconds: int) -> None:
+        key = self._revocation_key(subject)
+        previous = await self._redis.get(key)
+        if previous is not None:
+            revoked_at = max(revoked_at, float(previous))
+        await self._redis.set(key, repr(revoked_at), ex=ttl_seconds)
+
+    async def revoked_at(self, subject: str) -> float | None:
+        value = await self._redis.get(self._revocation_key(subject))
+        return None if value is None else float(value)
 
     async def check_and_increment(self, nonce: str, max_uses: int, ttl_seconds: int) -> int:
         key = f"{self._key_prefix}{nonce}"
@@ -224,13 +244,48 @@ class RedisProvenanceStore(ProvenanceStore):
     def _key(self, document_id: str) -> str:
         return f"{self._key_prefix}{document_id}"
 
+    def _index_key(self, decision: str) -> str:
+        # A sorted set per decision, scored by recorded_at, so the review
+        # queue reads oldest-first without scanning every hash. Kept in
+        # step by record/set_decision/delete. Two keys per write but no
+        # MULTI, so no cross-slot transaction: still cluster-safe.
+        return f"{self._key_prefix}by_decision:{decision}"
+
     async def record(self, record: ProvenanceRecord) -> None:
+        previous = await self._redis.hget(self._key(record.document_id), "decision")
+        if previous is not None and _text(previous) != record.decision:
+            await self._redis.zrem(self._index_key(_text(previous)), record.document_id)
         # to_dict() is dict[str, str] throughout; the redis-py stubs spell
         # the accepted mapping type more narrowly than the server does.
         await self._redis.hset(
             self._key(record.document_id),
             mapping=record.to_dict(),  # type: ignore[arg-type]
         )
+        await self._redis.zadd(self._index_key(record.decision), {record.document_id: record.recorded_at})
+
+    async def list_by_decision(self, decision: str, limit: int = 100) -> list[ProvenanceRecord]:
+        ids = await self._redis.zrange(self._index_key(decision), 0, max(limit - 1, 0))
+        records = []
+        for raw_id in ids:
+            # ZRANGE without WITHSCORES returns members only; the stub's
+            # union also covers the WITHSCORES shape, hence the narrowing.
+            if not isinstance(raw_id, (str, bytes)):
+                continue
+            record = await self.get(_text(raw_id))
+            # The index is written after the hash and can lag a delete by
+            # one command; never report a ghost or a stale decision.
+            if record is not None and record.decision == decision:
+                records.append(record)
+        return records
+
+    async def set_decision(self, document_id: str, decision: str) -> bool:
+        record = await self.get(document_id)
+        if record is None:
+            return False
+        await self._redis.hset(self._key(document_id), "decision", decision)
+        await self._redis.zrem(self._index_key(record.decision), document_id)
+        await self._redis.zadd(self._index_key(decision), {document_id: record.recorded_at})
+        return True
 
     async def get(self, document_id: str) -> ProvenanceRecord | None:
         data = await self._redis.hgetall(self._key(document_id))
@@ -239,4 +294,7 @@ class RedisProvenanceStore(ProvenanceStore):
         return ProvenanceRecord.from_dict(data)
 
     async def delete(self, document_id: str) -> None:
+        previous = await self._redis.hget(self._key(document_id), "decision")
         await self._redis.delete(self._key(document_id))
+        if previous is not None:
+            await self._redis.zrem(self._index_key(_text(previous)), document_id)

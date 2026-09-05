@@ -296,6 +296,15 @@ class ResilientBackend:
         self._on_degraded = on_degraded
         return self
 
+    def breaker_states(self) -> dict[str, str]:
+        """For a health report: which (operation, instance) breakers are
+        currently open. An empty dict is the healthy answer."""
+        return {
+            f"{op}:{inst}" if inst else op: "open"
+            for (op, inst), breaker in self._breakers.items()
+            if breaker.is_tripped
+        }
+
     def _breaker(self, operation: str, instance: str) -> _CircuitBreaker:
         key = (operation, instance)
         breaker = self._breakers.get(key)

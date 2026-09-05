@@ -95,33 +95,35 @@ class SessionRateLimiter:
         # note that every degraded call is reported, never silent.
         self._resilience = resilience or ResilientBackend(failure_policy)
 
-    async def check_request(self, session_id: str) -> None:
+    async def check_request(self, session_id: str, limits: SessionLimits | None = None) -> None:
+        limits = limits or self.limits
         # Only the round trip goes inside run(): RateLimitExceeded below is
         # a decision about the traffic, not a backend failure, and must not
         # be mistaken for one.
         count = await self._resilience.run(
             RATE_LIMIT,
-            lambda: self._store.increment_requests(session_id, self.limits.window_seconds),
+            lambda: self._store.increment_requests(session_id, limits.window_seconds),
         )
         if isinstance(count, Degraded):
             return
-        if count > self.limits.max_requests_per_window:
+        if count > limits.max_requests_per_window:
             raise RateLimitExceeded(
-                f"Session '{session_id}' exceeded {self.limits.max_requests_per_window} "
-                f"requests within {self.limits.window_seconds}s."
+                f"Session '{session_id}' exceeded {limits.max_requests_per_window} "
+                f"requests within {limits.window_seconds}s."
             )
 
-    async def check_tool_call(self, session_id: str) -> None:
+    async def check_tool_call(self, session_id: str, limits: SessionLimits | None = None) -> None:
+        limits = limits or self.limits
         count = await self._resilience.run(
             RATE_LIMIT,
-            lambda: self._store.increment_tool_calls(session_id, self.limits.window_seconds),
+            lambda: self._store.increment_tool_calls(session_id, limits.window_seconds),
         )
         if isinstance(count, Degraded):
             return
-        if count > self.limits.max_tool_calls_per_window:
+        if count > limits.max_tool_calls_per_window:
             raise RateLimitExceeded(
-                f"Session '{session_id}' exceeded {self.limits.max_tool_calls_per_window} "
-                f"tool calls within {self.limits.window_seconds}s."
+                f"Session '{session_id}' exceeded {limits.max_tool_calls_per_window} "
+                f"tool calls within {limits.window_seconds}s."
             )
 
     async def record_turn_risk(
@@ -145,6 +147,7 @@ class SessionRateLimiter:
 
     async def record_turn_risk_and_check(
         self, session_id: str, risk_score: float, actor_id: str | None = None,
+        limits: SessionLimits | None = None,
     ) -> tuple[float, bool]:
         """record_turn_risk, plus whether the session or actor is flagged
         after the update.
@@ -155,14 +158,15 @@ class SessionRateLimiter:
         with an actor. `record_turn_risk` remains for callers that only
         want the number.
         """
+        limits = limits or self.limits
         update = await self._resilience.run(
             SESSION_RISK,
             lambda: self._store.add_risk(
                 session_id,
                 risk_delta=risk_score,
-                decay_per_second=self.limits.risk_decay_per_second,
-                flag_threshold=self.limits.cumulative_risk_threshold,
-                ttl_seconds=self.limits.session_ttl_seconds,
+                decay_per_second=limits.risk_decay_per_second,
+                flag_threshold=limits.cumulative_risk_threshold,
+                ttl_seconds=limits.session_ttl_seconds,
             ),
         )
         flagged = False if isinstance(update, Degraded) else update.flagged
@@ -172,9 +176,9 @@ class SessionRateLimiter:
                 lambda: self._store.add_risk(
                     self.actor_key(actor_id),
                     risk_delta=risk_score,
-                    decay_per_second=self.limits.risk_decay_per_second,
-                    flag_threshold=self.limits.actor_risk_threshold,
-                    ttl_seconds=self.limits.actor_ttl_seconds,
+                    decay_per_second=limits.risk_decay_per_second,
+                    flag_threshold=limits.actor_risk_threshold,
+                    ttl_seconds=limits.actor_ttl_seconds,
                 ),
             )
             if not isinstance(actor_update, Degraded):

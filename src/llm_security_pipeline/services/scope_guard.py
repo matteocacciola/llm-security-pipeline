@@ -27,11 +27,12 @@ import logging
 import re
 import secrets
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
 from ..resilience import (
+    BackendUnavailable,
     Degraded,
     TOKEN_REPLAY,
     FailurePolicy,
@@ -83,6 +84,16 @@ _KID_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,64}\Z")
 MIN_KEY_BYTES = 32
 
 DEFAULT_KEY_ID = "default"
+
+# A revocation record must outlive the longest token it is meant to kill.
+# Tokens default to a five-minute TTL; a day covers any TTL a deployment
+# is likely to configure, and the record is one small key.
+DEFAULT_REVOCATION_TTL = 24 * 3600
+
+# Every link in a delegation chain is a token that can be spent; a chain
+# that grows without limit is a way to manufacture tokens. Eight is more
+# than any orchestrator topology needs.
+MAX_DELEGATION_DEPTH = 8
 
 
 _AUDIENCE_RE = re.compile(r"\A[A-Za-z0-9._:/-]{1,128}\Z")
@@ -371,7 +382,29 @@ class ScopeGuard:
         failure_policy: FailurePolicy | None = None,
         resilience: ResilientBackend | None = None,
         audience: str | None = None,
+        keyring_provider: "Callable[[], SigningKeyring] | None" = None,
+        reload_interval_seconds: float = 60.0,
     ):
+        # A rotation is three deploys only because the keyring is fixed at
+        # construction. With a provider — a callable that reads the current
+        # keyring from wherever the keys live — each step is a write to the
+        # secret manager, picked up within `reload_interval_seconds` by
+        # every process without a restart. A provider that raises leaves
+        # the last good keyring in place and is logged once, so a secret
+        # manager outage degrades to "no rotation right now", never to
+        # "no signing".
+        if keyring_provider is not None and (secret_key is not None or keyring is not None):
+            raise ValueError("Pass either keyring_provider or a fixed secret_key/keyring, not both.")
+        if reload_interval_seconds <= 0:
+            raise ValueError("reload_interval_seconds must be positive.")
+        self._keyring_provider = keyring_provider
+        self._reload_interval = reload_interval_seconds
+        self._last_reload = time.monotonic()
+        self._provider_failed_once = False
+        if keyring_provider is not None:
+            keyring = keyring_provider()
+            if not isinstance(keyring, SigningKeyring):
+                raise TypeError("keyring_provider must return a SigningKeyring.")
         # Which service this guard IS. Tokens it issues name it, and tokens
         # it verifies must name it back. The README tells you to give every
         # process the same signing key — and it has to — but the moment
@@ -434,19 +467,52 @@ class ScopeGuard:
 
     @property
     def keyring(self) -> SigningKeyring:
+        self._maybe_reload()
         return self._keyring
+
+    def _maybe_reload(self) -> None:
+        if self._keyring_provider is None:
+            return
+        if time.monotonic() - self._last_reload < self._reload_interval:
+            return
+        self._last_reload = time.monotonic()
+        try:
+            fresh = self._keyring_provider()
+            if not isinstance(fresh, SigningKeyring):
+                raise TypeError("keyring_provider must return a SigningKeyring.")
+        except Exception as exc:
+            if not self._provider_failed_once:
+                logger.warning(
+                    "ScopeGuard: keyring_provider failed (%s: %s); keeping the last good "
+                    "keyring (active %r). Rotation is paused until it recovers.",
+                    type(exc).__name__, exc, self._keyring.active,
+                )
+                self._provider_failed_once = True
+            return
+        self._provider_failed_once = False
+        if fresh != self._keyring:
+            logger.info(
+                "ScopeGuard: keyring reloaded; active %r -> %r, accepted %s",
+                self._keyring.active, fresh.active, ", ".join(fresh.key_ids),
+            )
+            self._keyring = fresh
+
+    def reload_keys(self) -> None:
+        """Ask the provider now rather than at the next interval."""
+        self._last_reload = 0.0
+        self._maybe_reload()
 
     @property
     def active_key_id(self) -> str:
         """Which key this guard is currently signing with. Worth exporting
         during a rotation: it is how you confirm a deploy actually took."""
-        return self._keyring.active
+        return self.keyring.active
 
     def _sign_bytes(self, raw: bytes, key: bytes) -> str:
         return hmac.new(key, raw, hashlib.sha256).hexdigest()
 
     def _sign(self, payload: dict) -> str:
-        return self._sign_bytes(canonical_payload_bytes(payload), self._keyring.signing_key()[1])
+        return self._sign_bytes(canonical_payload_bytes(payload), self.keyring.signing_key()[1])
 
     def issue_token(
         self,
@@ -470,7 +536,7 @@ class ScopeGuard:
                 "(require_subject=True), but issue_token was called without one. "
                 "Pass the authenticated end-user identifier as subject=."
             )
-        kid, key = self._keyring.signing_key()
+        kid, key = self.keyring.signing_key()
         payload: dict = {
             "agent_id": agent_id,
             "scopes": sorted(set(scopes)),
@@ -512,7 +578,7 @@ class ScopeGuard:
                 "from before key rotation existed."
             )
         try:
-            key = self._keyring.verification_key(kid)
+            key = self.keyring.verification_key(kid)
         except UnknownKeyId as exc:
             if self._ephemeral_key:
                 raise UnknownKeyId(
@@ -533,6 +599,119 @@ class ScopeGuard:
                     "one explicit secret_key before treating it as tampering."
                 )
             raise ScopeError("Invalid token signature: possible tampering.")
+
+    async def revoke_subject(self, subject: str, ttl_seconds: int = DEFAULT_REVOCATION_TTL) -> float:
+        """Refuse every token this subject currently holds.
+
+        For a compromised or departed user: tokens are bearer credentials
+        with a TTL, and until now the only answer to "they were phished
+        ten minutes ago" was to wait the TTL out. The revocation instant is
+        recorded in the nonce store; tokens with `issued_at` at or before
+        it are refused, tokens issued afterwards are not, so the subject
+        can be re-issued tokens without un-revoking anything. `ttl_seconds`
+        is how long the record lives and MUST exceed the longest token TTL
+        the deployment issues. Returns the instant recorded.
+        """
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive.")
+        revoked_at = time.time()
+        outcome = await self._resilience.run(
+            TOKEN_REPLAY,
+            lambda: self._nonce_store.revoke_subject(subject, revoked_at, ttl_seconds),
+        )
+        if isinstance(outcome, Degraded):
+            # Fail-open on the replay category would mean "revocation not
+            # recorded, request proceeds" — acceptable for a check, never
+            # for the revocation itself. A caller who asked to revoke and
+            # was told yes must not find the tokens still working.
+            raise BackendUnavailable(TOKEN_REPLAY)
+        return revoked_at
+
+    def attenuate(
+        self,
+        parent: CapabilityToken,
+        scopes: list[str],
+        ttl_seconds: int | None = None,
+        max_uses: int | None = None,
+        constraints: dict | None = None,
+    ) -> CapabilityToken:
+        """Derive a narrower token from `parent` for handing to another agent.
+
+        A multi-agent system delegates: the orchestrator holding a token for
+        five actions asks a sub-agent to do one of them. Passing the whole
+        token down gives the sub-agent all five. Attenuation gives it a
+        token that can only shrink: a subset of the scopes, an expiry no
+        later than the parent's, at most as many uses, every parent
+        constraint kept and only new ones added, the same subject and the
+        same audience. Each of those is enforced here, not trusted from
+        the caller, and the result is a token like any other — verifiable,
+        single-spend, bound — with `parent` and `depth` in its signed
+        payload so the chain can be read back from the audit log.
+
+        Only a guard holding the signing key can attenuate, so the holder
+        of a token cannot mint one for themselves; delegation goes through
+        the authority that issued the original.
+        """
+        self._verify_signature(parent)
+        payload = parent.payload
+        now = time.time()
+        if now > payload["expires_at"]:
+            raise ScopeError("Cannot attenuate an expired token.")
+
+        depth = int(payload.get("depth", 0)) + 1
+        if depth > MAX_DELEGATION_DEPTH:
+            raise ScopeError(f"Delegation chain would exceed {MAX_DELEGATION_DEPTH} links.")
+
+        wanted = sorted(set(scopes))
+        widening = [a for a in wanted if a not in payload["scopes"]]
+        if widening:
+            raise ScopeError(
+                f"Attenuation can only narrow scope; {', '.join(widening)} not in parent "
+                f"scope {payload['scopes']}."
+            )
+        if not wanted:
+            raise ScopeError("An attenuated token needs at least one scope.")
+
+        expires_at = payload["expires_at"]
+        if ttl_seconds is not None:
+            if ttl_seconds <= 0:
+                raise ValueError("ttl_seconds must be positive.")
+            expires_at = min(expires_at, now + ttl_seconds)
+
+        uses = payload["max_uses"] if max_uses is None else max_uses
+        if uses < 1 or uses > payload["max_uses"]:
+            raise ScopeError(
+                f"An attenuated token may use at most its parent's max_uses "
+                f"({payload['max_uses']}); got {uses}."
+            )
+
+        merged = dict(payload.get("constraints") or {})
+        for key, value in (constraints or {}).items():
+            if key in merged and merged[key] != value:
+                raise ScopeError(
+                    f"Attenuation cannot change parent constraint {key!r} "
+                    f"({merged[key]!r} -> {value!r}); it can only add constraints."
+                )
+            merged[key] = value
+
+        kid, key = self.keyring.signing_key()
+        child: dict = {
+            "agent_id": payload["agent_id"],
+            "scopes": wanted,
+            "issued_at": now,
+            "expires_at": expires_at,
+            "nonce": secrets.token_hex(16),
+            "max_uses": uses,
+            "subject": payload.get("subject"),
+            "constraints": merged,
+            "kid": kid,
+            # Inherited, not this guard's own: a guard without an audience
+            # attenuating a token minted for "orders" must not strip that.
+            "aud": payload.get("aud"),
+            "parent": payload["nonce"],
+            "depth": depth,
+        }
+        return CapabilityToken(payload=child, signature=self._sign_bytes(canonical_payload_bytes(child), key))
 
     async def authorize(
         self, token: CapabilityToken, action: str, subject: str | None = None,
@@ -592,6 +771,25 @@ class ScopeGuard:
                 f"Action '{action}' not authorized for agent "
                 f"'{token.payload['agent_id']}'. Granted scope: {token.payload['scopes']}"
             )
+
+        # Revocation before the nonce is spent: a refused token must not
+        # consume one of its uses. Same failure category as the replay
+        # check, for the same reason — "cannot tell whether this person
+        # was revoked" is not a reason to let their token through.
+        if bound_subject is not None:
+            revoked = await self._resilience.run(
+                TOKEN_REPLAY, lambda: self._nonce_store.revoked_at(str(bound_subject)),
+            )
+            if (
+                not isinstance(revoked, Degraded)
+                and revoked is not None
+                and float(token.payload.get("issued_at", 0.0)) <= revoked
+            ):
+                raise ScopeError(
+                    f"Token was issued before subject {bound_subject!r} was revoked; "
+                    "every token that subject held is refused until they are issued "
+                    "new ones."
+                )
 
         remaining_ttl = max(1, int(token.payload["expires_at"] - now))
         uses = await self._resilience.run(

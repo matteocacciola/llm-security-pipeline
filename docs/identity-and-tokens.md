@@ -105,6 +105,33 @@ happens to fail too. The pipeline takes it as `scope_audience=`, and
 `PipelineConfig` as `audience` (it is an identity, not a secret, so it
 belongs in config; the key does not).
 
+## Revoking a subject
+
+Tokens are bearer credentials with a TTL, and until now the only answer to
+"that user was phished ten minutes ago" was to wait the TTL out.
+`pipeline.revoke_subject(subject)` records the instant in the nonce store;
+every token of that subject with `issued_at` at or before it is refused,
+tokens issued afterwards are not, so the subject can be re-issued without
+un-revoking anything. The check runs before the nonce is spent, so a
+refused token does not consume a use. The revocation record lives
+`ttl_seconds` (default a day) and **must outlive the longest token TTL you
+issue**. Revoking is fail-closed on the write: a caller told "revoked" must
+not find the tokens still working. Audited as `subject_revoked`.
+
+## Delegating with an attenuated token
+
+An orchestrator holding a token for five actions asks a sub-agent to do
+one. Passing the token down gives it all five. `pipeline.attenuate(parent,
+scopes=[...], ttl_seconds=, max_uses=, constraints=)` derives a token that
+can only shrink — a subset of the scopes, an expiry no later than the
+parent's, at most as many uses, every parent constraint kept and only new
+ones added, the same subject and audience — with each rule enforced by the
+guard, not trusted from the caller. The child carries `parent` (the
+parent's nonce) and `depth` in its signed payload, so the chain reads back
+from the audit log; depth is capped at `MAX_DELEGATION_DEPTH` (8). Only a
+guard holding the signing key can attenuate: the holder of a token cannot
+mint one for themselves.
+
 ## Rotating the signing key
 
 A capability token is signed once and verified later, possibly in another
@@ -146,6 +173,14 @@ Knowing when step 3 is safe is a question about traffic, not about the
 clock, so `token_key_id` is on every `tool_call` audit event: the old key
 can go once no spent token has named it for longer than the longest TTL you
 issue.
+
+**Without a restart.** Pass `scope_keyring_provider=` (a callable returning
+the current `SigningKeyring`, typically reading your secret manager) and
+the guard re-reads it every `scope_key_reload_seconds`; each of the three
+rotation steps becomes a write to the secret manager, picked up by every
+process. A provider that raises leaves the last good keyring in place and
+is logged once, so a secret-manager outage degrades to "no rotation right
+now", never to "no signing". `reload_keys()` forces a read.
 
 `scope_secret_key=` is still there and is shorthand for
 `SigningKeyring.single(key)` under the id `"default"` — fine until the

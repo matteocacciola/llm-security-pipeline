@@ -76,6 +76,7 @@ import asyncio
 import contextlib
 import contextvars
 import dataclasses
+import inspect
 import logging
 import functools
 import json
@@ -106,7 +107,8 @@ from .services import (
     SessionLimits,
     RateLimitExceeded,
 )
-from .services.output_guard import Canary
+from .services.output_guard import Canary, clean_forbidden_literals
+from .services.scope_guard import DEFAULT_REVOCATION_TTL
 from .services.detectors import (
     DetectorEnsemble,
     EnsembleResult,
@@ -137,7 +139,7 @@ logger = logging.getLogger(__name__)
 # Stamped on every audit event. Bump it when a field is added, renamed or
 # changes meaning, so a consumer parsing the stream can branch on it instead
 # of discovering the change when its parser breaks. History in CHANGELOG.md.
-AUDIT_SCHEMA_VERSION = 3
+AUDIT_SCHEMA_VERSION = 4
 
 # Degradations collected for the request currently being handled. A
 # ContextVar rather than an attribute because one SecurityPipeline serves
@@ -245,9 +247,11 @@ def _scan_output(
     text: str,
     system_prompt: str | None,
     overlap_threshold: float,
+    forbidden_literals: tuple[str, ...] = (),
 ) -> tuple[OutputScanResult, ExfilScanResult | None]:
     result = output_guard.scan(
         text, system_prompt=system_prompt, overlap_threshold=overlap_threshold,
+        forbidden_literals=forbidden_literals,
     )
     # The side-channel scan runs over the REDACTED text: a secret the output
     # guard has already replaced can no longer be smuggled out in a URL, and
@@ -319,9 +323,12 @@ class GuardedStream:
         pipeline: "SecurityPipeline",
         source: AsyncIterator[str],
         holdback_chars: int = DEFAULT_HOLDBACK_CHARS,
+        principal: str | None = None,
     ):
         self._pipeline = pipeline
         self._source = source
+        self._principal = principal
+        self._forbidden: tuple[str, ...] | None = None
         shadow = pipeline.enforcement == "shadow"
         self._guard = StreamingOutputGuard(
             output_guard=pipeline.output_guard,
@@ -336,6 +343,7 @@ class GuardedStream:
             holdback_chars=0 if shadow else holdback_chars,
             redact_pii=not shadow,
         )
+        self._holdback = 0 if shadow else holdback_chars
         self._shadow = shadow
         self.blocked = False
         self.would_block = False
@@ -348,6 +356,11 @@ class GuardedStream:
         return self
 
     async def __anext__(self) -> str:
+        if self._forbidden is None:
+            # Resolved once, on the first pull, because the resolver may be
+            # async and __init__ cannot await.
+            self._forbidden = await self._pipeline._forbidden_literals(self._principal)
+            self._guard.forbidden_literals = self._forbidden
         while True:
             try:
                 chunk = await self._source.__anext__()
@@ -453,6 +466,8 @@ class SecurityPipeline:
         scope_secret_key: bytes | None = None,
         scope_keyring: SigningKeyring | None = None,
         scope_audience: str | None = None,
+        scope_keyring_provider: "Callable[[], SigningKeyring] | None" = None,
+        scope_key_reload_seconds: float = 60.0,
         sanitizer: Sanitizer | None = None,
         output_guard: OutputGuard | None = None,
         exfil_guard: ExfilGuard | None = None,
@@ -468,6 +483,8 @@ class SecurityPipeline:
         detectors: "list[Registration] | DetectorEnsemble | None" = None,
         metrics: MetricsSink | None = None,
         tracer: Tracer | None = None,
+        limits_for: "Callable[[str | None], SessionLimits | None] | None" = None,
+        foreign_identifiers: "Callable[[str], Any] | None" = None,
         canary: "Canary | bool | None" = None,
         rate_limiter: SessionRateLimiter | None = None,
         audit_logger: AuditLogger | None = None,
@@ -522,7 +539,8 @@ class SecurityPipeline:
         self.session_identity = session_identity or "untrusted"
 
         if scope_guard is not None and (
-            scope_secret_key is not None or scope_keyring is not None or scope_audience is not None
+            scope_secret_key is not None or scope_keyring is not None
+            or scope_audience is not None or scope_keyring_provider is not None
         ):
             raise ValueError(
                 "Pass either scope_guard or scope_secret_key/scope_keyring/scope_audience, "
@@ -546,6 +564,19 @@ class SecurityPipeline:
         # log: that one is per-request and keeps identifiers, this one is
         # aggregate and carries none. See metrics.py.
         self.metrics = SafeMetricsSink(metrics)
+        # Per-tier budgets without N pipelines: called with the principal
+        # (None when there is none) and returning a SessionLimits to use
+        # for this call, or None for the defaults. Consulted once per
+        # request; a callable that raises is a bug and is not swallowed.
+        self.limits_for = limits_for
+        # Cross-tenant leak detection. Given the principal a response is
+        # for, returns the identifiers (emails, account numbers, names)
+        # that belong to OTHER principals and must not appear in it. The
+        # library cannot know whose data is whose; the application can.
+        # Sync or async. What comes back is matched as a secret, so it
+        # blocks and redacts through the same path a credential does,
+        # buffered or streamed.
+        self.foreign_identifiers = foreign_identifiers
         # Spans per guard, under the application's own tracer. Same rule
         # as metrics for what may be an attribute: no identifiers.
         self.tracer = SafeTracer(tracer)
@@ -563,7 +594,8 @@ class SecurityPipeline:
             # ScopeGuard warns about that itself; the warning is escalated
             # here because a state_backend is proof that more than one
             # process is expected to share this state.
-            if scope_secret_key is None and scope_keyring is None and state_backend is not None:
+            if (scope_secret_key is None and scope_keyring is None
+                    and scope_keyring_provider is None and state_backend is not None):
                 logger.warning(
                     "SecurityPipeline: a state_backend was configured (so this "
                     "deployment expects several processes to share state) but no "
@@ -576,6 +608,8 @@ class SecurityPipeline:
                 secret_key=scope_secret_key,
                 keyring=scope_keyring,
                 audience=scope_audience,
+                keyring_provider=scope_keyring_provider,
+                reload_interval_seconds=scope_key_reload_seconds,
                 resilience=self._resilience,
                 nonce_store=state_backend.nonce_store if state_backend is not None else None,
                 # An authenticated deployment gets subject-bound tokens by
@@ -747,12 +781,95 @@ class SecurityPipeline:
             return self.system_prompt
         return self.canary.plant(self.system_prompt)
 
+    def _limits(self, principal: str | None) -> "SessionLimits | None":
+        return self.limits_for(principal) if self.limits_for is not None else None
+
+    # -- Tokens: revoke, delegate ------------------------------------------
+
+    async def revoke_subject(self, subject: str, ttl_seconds: int = DEFAULT_REVOCATION_TTL) -> float:
+        """Refuse every capability token `subject` holds. See ScopeGuard.revoke_subject."""
+        revoked_at = await self.scope_guard.revoke_subject(subject, ttl_seconds)
+        await self._audit("subject_revoked", {"subject": subject, "revoked_at": revoked_at})
+        self.metrics.increment("requests_total", stage="revocation", outcome="revoked",
+                               enforcement=self.enforcement)
+        return revoked_at
+
+    def attenuate(self, parent, scopes: list[str], **kwargs):
+        """Derive a narrower token for a sub-agent. See ScopeGuard.attenuate."""
+        return self.scope_guard.attenuate(parent, scopes, **kwargs)
+
+    # -- Ingest review -----------------------------------------------------
+
+    async def review_queue(self, limit: int = 100):
+        return await self.ingest_guard.review_queue(limit)
+
+    async def approve_document(self, document_id: str) -> bool:
+        decided = await self.ingest_guard.approve(document_id)
+        await self._audit("ingest_review", {"document_id": document_id, "decision": "accept", "applied": decided})
+        return decided
+
+    async def reject_document(self, document_id: str) -> bool:
+        decided = await self.ingest_guard.reject(document_id)
+        await self._audit("ingest_review", {"document_id": document_id, "decision": "reject", "applied": decided})
+        return decided
+
+    def _all_resilience(self) -> list[ResilientBackend]:
+        seen: list[ResilientBackend] = [self._resilience]
+        for guard in (self.rate_limiter, self.scope_guard, self.ingest_guard, self.detectors):
+            backend = getattr(guard, "_resilience", None) or getattr(guard, "resilience", None)
+            if isinstance(backend, ResilientBackend) and all(backend is not b for b in seen):
+                seen.append(backend)
+        return seen
+
+    # -- Health ------------------------------------------------------------
+
+    async def health(self, timeout_seconds: float = 2.0) -> dict[str, Any]:
+        """What an operator wants from a health endpoint: is each backend
+        answering, are any breakers open, and what posture is running.
+
+        Never raises. Each probe is one cheap read against the real store
+        (a key that never exists), bounded by `timeout_seconds`, and its
+        failure is reported as a string rather than propagated. `status`
+        is "ok" when every probe passed and no breaker is open,
+        "degraded" otherwise — the same word the failure policy uses,
+        because it means the same thing: some checks are not running.
+        """
+        probes: dict[str, str] = {}
+
+        async def probe(name: str, call) -> None:
+            try:
+                await asyncio.wait_for(call(), timeout_seconds)
+                probes[name] = "ok"
+            except Exception as exc:
+                probes[name] = f"{type(exc).__name__}: {exc}"[:120]
+
+        await probe("session_store", lambda: self.rate_limiter._store.is_flagged("__health__"))
+        await probe("nonce_store", lambda: self.scope_guard._nonce_store.revoked_at("__health__"))
+        if self.ingest_guard.provenance_store is not None:
+            await probe("provenance_store", lambda: self.ingest_guard.provenance_store.get("__health__"))
+
+        # Every guard's breakers, not just the pipeline's own: a caller-
+        # supplied guard keeps its own ResilientBackend (and its own
+        # policy), and a breaker open in there is exactly as much "some
+        # checks are not running" as one in here.
+        open_breakers: dict[str, str] = {}
+        for backend in self._all_resilience():
+            open_breakers.update(backend.breaker_states())
+        healthy = all(v == "ok" for v in probes.values()) and not open_breakers
+        return {
+            "status": "ok" if healthy else "degraded",
+            "backends": probes,
+            "open_breakers": open_breakers,
+            "posture": self.config_summary,
+        }
+
     # -- Streaming output -------------------------------------------------
 
     def guard_stream(
         self,
         source: "AsyncIterator[str]",
         holdback_chars: int = DEFAULT_HOLDBACK_CHARS,
+        principal: str | None = None,
     ) -> "GuardedStream":
         """Wrap a token stream so it is scanned while it is still arriving.
 
@@ -767,7 +884,7 @@ class SecurityPipeline:
         offending text above it on screen. Replacing the message is the
         caller's job and there is no way for this to do it for them.
         """
-        return GuardedStream(self, source, holdback_chars=holdback_chars)
+        return GuardedStream(self, source, holdback_chars=holdback_chars, principal=principal)
 
     async def _scan_tool_result(
         self, action: str, output: object, session_id: str | None, principal: str | None,
@@ -995,6 +1112,7 @@ class SecurityPipeline:
     ) -> PreProcessResult:
         self._require_principal(principal, "pre_process")
         actor_id = actor_id or principal
+        limits = self._limits(principal)
         scoped_session = (
             self.session_key(session_id, principal) if session_id is not None else None
         )
@@ -1047,7 +1165,7 @@ class SecurityPipeline:
                 # system — but going over budget is recorded, not raised.
                 scan_outcome, limit_outcome = await asyncio.gather(
                     scan_awaitable,
-                    self.rate_limiter.check_request(scoped_session),
+                    self.rate_limiter.check_request(scoped_session, limits=limits),
                     return_exceptions=True,
                 )
                 if isinstance(scan_outcome, BaseException):
@@ -1058,7 +1176,7 @@ class SecurityPipeline:
                     raise limit_outcome
             else:
                 result, _ = await asyncio.gather(
-                    scan_awaitable, self.rate_limiter.check_request(scoped_session)
+                    scan_awaitable, self.rate_limiter.check_request(scoped_session, limits=limits)
                 )
         else:
             result = await scan_awaitable
@@ -1086,7 +1204,7 @@ class SecurityPipeline:
             # applies the risk, so asking for it separately was a second
             # (and with an actor, third) round trip for nothing.
             cumulative, session_flagged = await self.rate_limiter.record_turn_risk_and_check(
-                scoped_session, combined_risk, actor_id=actor_id,
+                scoped_session, combined_risk, actor_id=actor_id, limits=limits,
             )
 
         await self._audit("input_scan", {
@@ -1310,12 +1428,13 @@ class SecurityPipeline:
 
     # -- Output ---------------------------------------------------------
 
-    async def post_process(self, model_output: str) -> PostProcessResult:
+    async def post_process(self, model_output: str, principal: str | None = None) -> PostProcessResult:
         with self._collecting_degradations() as degraded, self.tracer.span(
             "post_process", enforcement=self.enforcement,
         ) as span:
             with self.metrics.timed("scan_duration_seconds", stage="output"):
-                result = await self._post_process(model_output)
+                forbidden = await self._forbidden_literals(principal)
+                result = await self._post_process(model_output, forbidden)
             span.set_attribute("outcome", "blocked" if result.blocked else "allowed")
             span.set_attribute("secret_categories", list(result.scan.secret_findings))
             span.set_attribute("system_prompt_overlap_score", result.scan.system_prompt_overlap_score)
@@ -1359,7 +1478,17 @@ class SecurityPipeline:
             return "system_prompt_overlap"
         return "none"
 
-    async def _post_process(self, model_output: str) -> PostProcessResult:
+    async def _forbidden_literals(self, principal: str | None) -> tuple[str, ...]:
+        if self.foreign_identifiers is None or principal is None:
+            return ()
+        raw = self.foreign_identifiers(principal)
+        if inspect.isawaitable(raw):
+            raw = await raw
+        return clean_forbidden_literals(raw or ())
+
+    async def _post_process(
+        self, model_output: str, forbidden: tuple[str, ...] = (),
+    ) -> PostProcessResult:
         loop = asyncio.get_running_loop()
         # Both scans are pure CPU (regex); offload only if the text is large
         # enough for that to matter (same rationale as pre_process). They go
@@ -1375,6 +1504,7 @@ class SecurityPipeline:
                 model_output,
                 self.system_prompt,
                 self.output_overlap_threshold,
+                forbidden,
             )
         else:
             result, exfil = _scan_output(
@@ -1383,6 +1513,7 @@ class SecurityPipeline:
                 model_output,
                 self.system_prompt,
                 self.output_overlap_threshold,
+                forbidden,
             )
         blocked = result.blocked or (exfil is not None and exfil.blocked)
 
@@ -1596,7 +1727,9 @@ class SecurityPipeline:
         calls within the current window — mitigates DoS/cost abuse via
         excessive tool usage, independent of whether each individual call
         was in-scope."""
-        await self.rate_limiter.check_tool_call(self.session_key(session_id, principal))
+        await self.rate_limiter.check_tool_call(
+            self.session_key(session_id, principal), limits=self._limits(principal),
+        )
 
     async def authorized_tool_call(
         self,

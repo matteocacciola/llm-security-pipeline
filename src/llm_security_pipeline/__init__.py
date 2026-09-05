@@ -60,6 +60,8 @@ from .services import (
     DEFAULT_KEY_ID,
     MAX_TOKEN_CHARS,
     MIN_KEY_BYTES,
+    DEFAULT_REVOCATION_TTL,
+    MAX_DELEGATION_DEPTH,
     ExfilGuard,
     ExfilPolicy,
     IngestGuard,
@@ -202,6 +204,8 @@ __all__ = [
     "DEFAULT_KEY_ID",
     "MAX_TOKEN_CHARS",
     "MIN_KEY_BYTES",
+    "DEFAULT_REVOCATION_TTL",
+    "MAX_DELEGATION_DEPTH",
     # Output guard
     "ExfilGuard",
     "ExfilPolicy",
