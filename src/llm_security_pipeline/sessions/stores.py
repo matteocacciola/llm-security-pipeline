@@ -63,45 +63,66 @@ class NonceStore(ABC):
 
 
 class InMemoryNonceStore(NonceStore):
-    """Single-process implementation for local development and unit tests."""
+    """Single-process implementation for local development and unit tests.
 
-    def __init__(self):
-        self._counts: dict[str, int] = {}
+    Entries carry the token's expiry and are swept opportunistically, for
+    the same reason the in-memory session store does: a process that runs
+    for a week otherwise keeps one dictionary entry for every token it
+    ever saw. An expired nonce reads as unused, which is safe because the
+    token it belonged to is rejected on its own expiry first.
+    """
+
+    def __init__(self, sweep_interval_seconds: float = 60.0):
+        self._counts: dict[str, tuple[int, float]] = {}            # nonce -> (uses, expires_at)
+        self._revocations: dict[str, tuple[float, float]] = {}     # subject -> (revoked_at, expires_at)
+        self._sweep_interval = sweep_interval_seconds
+        self._last_sweep = time.time()
+
+    def _sweep(self, now: float) -> None:
+        if now - self._last_sweep < self._sweep_interval:
+            return
+        self._last_sweep = now
+        for nonce in [n for n, (_, exp) in self._counts.items() if exp <= now]:
+            del self._counts[nonce]
+        for subject in [s for s, (_, exp) in self._revocations.items() if exp <= now]:
+            del self._revocations[subject]
+
+    def sweep_now(self) -> None:
+        self._last_sweep = 0.0
+        self._sweep(time.time())
+
+    @property
+    def tracked_entries(self) -> int:
+        return len(self._counts) + len(self._revocations)
 
     async def check_and_increment(self, nonce: str, max_uses: int, ttl_seconds: int) -> int:
         # No real concurrency hazard within a single asyncio event loop
         # thread, since there is no `await` between read and write here.
-        self._counts[nonce] = self._counts.get(nonce, 0) + 1
-        return self._counts[nonce]
-
-    _revocations: dict[str, tuple[float, float]] | None = None  # subject -> (revoked_at, expires_at)
+        now = time.time()
+        self._sweep(now)
+        uses, expires_at = self._counts.get(nonce, (0, 0.0))
+        if expires_at <= now:
+            uses = 0
+        uses += 1
+        self._counts[nonce] = (uses, now + ttl_seconds)
+        return uses
 
     async def revoke_subject(self, subject: str, revoked_at: float, ttl_seconds: int) -> None:
-        if self._revocations is None:
-            self._revocations = {}
+        now = time.time()
+        self._sweep(now)
         previous = self._revocations.get(subject)
-        at = max(revoked_at, previous[0]) if previous else revoked_at
-        self._revocations[subject] = (at, time.time() + ttl_seconds)
+        at = max(revoked_at, previous[0]) if previous and previous[1] > now else revoked_at
+        self._revocations[subject] = (at, now + ttl_seconds)
 
     async def revoked_at(self, subject: str) -> float | None:
-        if not self._revocations:
-            return None
+        now = time.time()
+        self._sweep(now)
         entry = self._revocations.get(subject)
-        if entry is None:
+        if entry is None or entry[1] <= now:
             return None
-        at, expires = entry
-        if expires <= time.time():
-            del self._revocations[subject]
-            return None
-        return at
+        return entry[0]
 
 
-# ---------------------------------------------------------------------------
-# Session store (backs rate_limiter.py): request/tool-call budget +
-# cumulative cross-turn risk with time-based decay.
-# ---------------------------------------------------------------------------
-
-@dataclass
 class SessionCounters:
     request_count: int
     tool_call_count: int

@@ -177,3 +177,26 @@ def test_streaming_never_emits_more_than_it_was_given(case):
     if not final.blocked:
         out.append(final.text)
         assert "".join(out) == text
+
+
+@BUDGET
+@given(
+    scopes=st.lists(st.sampled_from(["read", "write", "delete", "admin", "list"]), min_size=1, max_size=5),
+    keep=st.lists(st.sampled_from(["read", "write", "delete", "admin", "list"]), min_size=0, max_size=5),
+    ttl=st.integers(1, 600), uses=st.integers(1, 5),
+)
+def test_attenuation_can_only_shrink(scopes, keep, ttl, uses):
+    """Whatever is asked for, a child that is issued at all is within its
+    parent on every axis; anything outside is refused, never widened."""
+    guard = ScopeGuard(secret_key=secrets.token_bytes(32))
+    parent = guard.issue_token("bot", scopes, max_uses=3, ttl_seconds=300, constraints={"a": "1"})
+    try:
+        child = guard.attenuate(parent, keep, ttl_seconds=ttl, max_uses=uses, constraints={"b": "2"})
+    except ScopeError:
+        assert not keep or not set(keep) <= set(scopes) or uses > 3
+        return
+    assert set(child.payload["scopes"]) <= set(parent.payload["scopes"])
+    assert child.payload["expires_at"] <= parent.payload["expires_at"]
+    assert child.payload["max_uses"] <= parent.payload["max_uses"]
+    assert child.payload["constraints"] == {"a": "1", "b": "2"}
+    assert child.payload["depth"] == 1

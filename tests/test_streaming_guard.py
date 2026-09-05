@@ -560,9 +560,46 @@ async def test_the_audit_event_records_a_partial_leak_distinctly():
             events.append((event_type, data))
 
     pipeline = SecurityPipeline(session_identity="untrusted", audit_logger=Collector())
-    guarded = pipeline.guard_stream(_stream(f"the token is {API_KEY} ok"), holdback_chars=8)
+    # min_chunk_chars=0: with coalescing on, the first 48-char chunk carries
+    # enough of the key to block before anything is emitted — no leak to
+    # record. This test wants the pathological case, so it turns that off.
+    guarded = pipeline.guard_stream(
+        _stream(f"the token is {API_KEY} ok"), holdback_chars=8, min_chunk_chars=0,
+    )
     [c async for c in guarded]
 
     scan = next(data for kind, data in events if kind == "output_scan")
     assert scan["leaked_before_holdback"] is True
     assert scan["emitted_chars"] > 0
+
+
+async def test_coalescing_turns_a_partial_leak_into_a_clean_block():
+    """The point of coalescing beyond CPU: a token-sized stream gives the
+    detector less context per feed than the hold-back can cover, and a
+    long credential leaks its prefix. Batched to 48 characters, the same
+    stream blocks with nothing emitted."""
+    pipeline = SecurityPipeline(session_identity="untrusted")
+    text = f"the token is {API_KEY} ok"
+
+    tiny = pipeline.guard_stream(_stream(text), holdback_chars=8, min_chunk_chars=0)
+    [c async for c in tiny]
+    batched = pipeline.guard_stream(_stream(text), holdback_chars=8)
+    out = [c async for c in batched]
+
+    assert tiny.leaked_before_holdback is True
+    assert batched.blocked is True and batched.leaked_before_holdback is False and out == []
+
+
+async def test_coalescing_never_loses_the_tail_of_a_clean_stream():
+    pipeline = SecurityPipeline(session_identity="untrusted")
+    text = "a perfectly ordinary reply that is a bit longer than one batch of text, then ends."
+    guarded = pipeline.guard_stream(_stream(text, size=3))
+    assert "".join([c async for c in guarded]) == text
+
+
+async def test_coalescing_is_off_in_shadow_mode():
+    """Shadow must forward exactly the model's chunks, at the model's pace."""
+    pipeline = SecurityPipeline(session_identity="untrusted", enforcement="shadow")
+    text = "one two three four five six seven eight nine ten eleven twelve"
+    chunks = [c async for c in pipeline.guard_stream(_stream(text, size=4))]
+    assert chunks == [text[i : i + 4] for i in range(0, len(text), 4)]

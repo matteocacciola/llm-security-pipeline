@@ -118,6 +118,8 @@ class PipelineConfig:
     # Which service this deployment is, for capability tokens. Not a
     # secret, so it belongs here; the key does not. See ScopeGuard.
     audience: str | None = None
+    # How often a keyring provider is re-read, when one is given.
+    key_reload_seconds: float = 60.0
     thresholds: ThresholdConfig = field(default_factory=ThresholdConfig)
     patterns: PatternConfig = field(default_factory=PatternConfig)
     exfil: ExfilConfig = field(default_factory=ExfilConfig)
@@ -136,6 +138,8 @@ class PipelineConfig:
                 f"PipelineConfig.session_identity must be one of {_IDENTITY_MODES}, "
                 f"got {self.session_identity!r}."
             )
+        if self.key_reload_seconds <= 0:
+            raise ValueError("PipelineConfig.key_reload_seconds must be positive.")
         if self.canary and self.system_prompt is None:
             raise ValueError("PipelineConfig: a canary needs a system_prompt to be planted in.")
 
@@ -164,6 +168,7 @@ class PipelineConfig:
             "system_prompt": self.system_prompt,
             "canary": self.canary or None,
             "scope_audience": self.audience,
+            "scope_key_reload_seconds": self.key_reload_seconds,
             "input_risk_threshold": self.thresholds.input_risk,
             "output_overlap_threshold": self.thresholds.output_overlap,
             "pii_config_path": self.patterns.pii_config_path,

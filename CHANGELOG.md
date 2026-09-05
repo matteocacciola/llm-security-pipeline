@@ -304,7 +304,24 @@ distribution."
   their documented error; streaming equals buffered for any text and any
   chunking.
 
-### Added — revocation, attenuation, confusables handling, tiered limits, reloadable keys, and health endpoint
+### Added — after block C
+
+- **Redis Cluster verified.** A 3-master cluster was stood up and every
+  test ran with zero skips (667). Two new `redis_cluster` tests pin the
+  block C paths that use two keys per operation (review-queue index,
+  revocation) as CROSSSLOT-safe.
+- **`InMemoryNonceStore` evicts.** Same debt the session store had:
+  spent nonces and revocations now carry the token's expiry and are
+  swept; `tracked_entries`, `sweep_now()`.
+- **Chunk coalescing in `guard_stream`** (`min_chunk_chars`, default
+  48; off in shadow mode): bounded CPU per stream, and a long credential
+  that would have leaked its prefix at token-sized chunks now blocks with
+  nothing emitted.
+- `PipelineConfig.key_reload_seconds`; the example's `/health` uses
+  `pipeline.health()`; a Hypothesis property that attenuation can only
+  shrink.
+
+### Added — block C
 
 Every store change below is implemented on the in-memory, Redis,
 PostgreSQL and MySQL stores and tested against all three real backends.
@@ -339,7 +356,7 @@ PostgreSQL and MySQL stores and tested against all three real backends.
   `cross_tenant_identifier`, buffered or streamed.
 - `AUDIT_SCHEMA_VERSION` → 4: events `subject_revoked`, `ingest_review`.
 
-### Added — observability and robustness
+### Added — block B
 
 - **Example service** `examples/fastapi_chat/`: YAML config via
   `PipelineConfig`, the planted system prompt sent to a (stub) model,

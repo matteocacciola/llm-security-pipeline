@@ -81,6 +81,12 @@ DEFAULT_MIN_CHARS_FOR_OVERLAP = 200
 # memory, so it is generous by default.
 DEFAULT_DETECTION_TAIL_CHARS = 512
 
+# Chunks smaller than this are coalesced by GuardedStream before feeding.
+# Per-feed cost is the window, not the chunk, so token-sized chunks cost
+# an order of magnitude more than this for no gain in latency: the
+# hold-back already delays emission by more.
+DEFAULT_MIN_CHUNK_CHARS = 48
+
 BLOCKED_MESSAGE = (
     "[Response blocked by the security layer: possible credential "
     "or system-prompt leak detected.]"

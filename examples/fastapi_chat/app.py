@@ -214,7 +214,12 @@ def _sse(event: str, data: dict[str, Any]) -> bytes:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    return {"status": "ok", "security": pipeline.config_summary}
+    # Probes the stores and reports open breakers; "degraded" means some
+    # checks are not running right now, which a load balancer may or may
+    # not want to route around — that is its call, this is the fact.
+    report = await pipeline.health()
+    return {"status": report["status"], "backends": report["backends"],
+            "open_breakers": report["open_breakers"], "security": report["posture"]}
 
 
 @app.get("/metrics")

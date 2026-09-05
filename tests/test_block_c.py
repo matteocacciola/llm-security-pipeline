@@ -566,3 +566,44 @@ async def test_review_queue_on_a_real_store(make_backend):
         for doc_id in ids:
             await backend.provenance_store.delete(doc_id)
         await backend.aclose()
+
+
+# ---------------------------------------------------------------------------
+# In-memory nonce store: eviction, the debt A4 fixed for sessions
+# ---------------------------------------------------------------------------
+
+
+async def test_spent_nonces_are_evicted_after_their_token_expires():
+    from llm_security_pipeline.sessions.stores import InMemoryNonceStore
+    import time
+
+    store = InMemoryNonceStore(sweep_interval_seconds=0)
+    for i in range(200):
+        await store.check_and_increment(f"n{i}", 1, ttl_seconds=1)
+    await store.revoke_subject("u1", time.time(), ttl_seconds=1)
+    assert store.tracked_entries == 201
+
+    time.sleep(1.1)
+    store.sweep_now()
+
+    assert store.tracked_entries == 0
+
+
+async def test_an_expired_nonce_reads_as_unused():
+    """Safe because the token it belonged to is rejected on expiry first."""
+    from llm_security_pipeline.sessions.stores import InMemoryNonceStore
+    import time
+
+    store = InMemoryNonceStore(sweep_interval_seconds=3600)
+    assert await store.check_and_increment("n", 1, ttl_seconds=1) == 1
+    assert await store.check_and_increment("n", 1, ttl_seconds=1) == 2
+    time.sleep(1.1)
+    assert await store.check_and_increment("n", 1, ttl_seconds=1) == 1
+
+
+async def test_replay_protection_still_holds_within_the_ttl():
+    guard = ScopeGuard(secret_key=KEY)
+    token = guard.issue_token("bot", ["read"], max_uses=1)
+    await guard.authorize(token, "read")
+    with pytest.raises(ScopeError, match="maximum"):
+        await guard.authorize(token, "read")

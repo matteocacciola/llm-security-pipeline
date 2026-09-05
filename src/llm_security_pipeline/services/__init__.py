@@ -67,6 +67,7 @@ from .streaming_guard import (
     StreamDelta,
     DEFAULT_HOLDBACK_CHARS,
     DEFAULT_DETECTION_TAIL_CHARS,
+    DEFAULT_MIN_CHUNK_CHARS,
 )
 from .detectors import (
     SemanticDetector,
@@ -121,6 +122,7 @@ __all__ = [
     "StreamDelta",
     "DEFAULT_HOLDBACK_CHARS",
     "DEFAULT_DETECTION_TAIL_CHARS",
+    "DEFAULT_MIN_CHUNK_CHARS",
     "SemanticDetector",
     "DetectorResult",
     "DetectorEnsemble",

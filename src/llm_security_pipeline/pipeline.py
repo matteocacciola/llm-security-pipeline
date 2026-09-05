@@ -116,6 +116,7 @@ from .services.detectors import (
 )
 from .services.streaming_guard import (
     DEFAULT_HOLDBACK_CHARS,
+    DEFAULT_MIN_CHUNK_CHARS,
     StreamDelta,
     StreamingOutputGuard,
 )
@@ -309,6 +310,16 @@ def _strings_in(value: object, _depth: int = 0) -> list[str]:
     return []
 
 
+class _Exhausted:
+    """A source with nothing left, so the next pull goes straight to finish()."""
+
+    def __aiter__(self) -> "_Exhausted":
+        return self
+
+    async def __anext__(self) -> str:
+        raise StopAsyncIteration
+
+
 class GuardedStream:
     """A model token stream with the output guard in front of it.
 
@@ -324,10 +335,19 @@ class GuardedStream:
         source: AsyncIterator[str],
         holdback_chars: int = DEFAULT_HOLDBACK_CHARS,
         principal: str | None = None,
+        min_chunk_chars: int = DEFAULT_MIN_CHUNK_CHARS,
     ):
         self._pipeline = pipeline
         self._source = source
         self._principal = principal
+        # Every feed rescans the window, so a model that streams one token
+        # at a time would cost window-size times a buffered scan. Chunks
+        # are coalesced up to this many characters before feeding; the
+        # hold-back already delays emission by more than that, so the
+        # user sees nothing different. Off in shadow mode, where timing
+        # must be exactly the model's.
+        self._min_chunk = 0 if pipeline.enforcement == "shadow" else max(0, min_chunk_chars)
+        self._pending = ""
         self._forbidden: tuple[str, ...] | None = None
         shadow = pipeline.enforcement == "shadow"
         self._guard = StreamingOutputGuard(
@@ -365,6 +385,19 @@ class GuardedStream:
             try:
                 chunk = await self._source.__anext__()
             except StopAsyncIteration:
+                if self._pending:
+                    # Whatever was still being coalesced goes in before
+                    # finish(), or it would never be scanned or emitted.
+                    tail, self._pending = self._pending, ""
+                    delta = self._guard.feed(tail)
+                    self._record(delta)
+                    if self._is_blocking(delta):
+                        await self._audit_once()
+                        raise
+                    if delta.text:
+                        # Hand this out now; finish() runs on the next pull.
+                        self._source = _Exhausted()
+                        return delta.text
                 delta = self._guard.finish()
                 self._record(delta)
                 await self._audit_once()
@@ -377,6 +410,11 @@ class GuardedStream:
                 await self._audit_once()
                 raise
 
+            if self._min_chunk:
+                self._pending += chunk
+                if len(self._pending) < self._min_chunk:
+                    continue
+                chunk, self._pending = self._pending, ""
             delta = self._guard.feed(chunk)
             self._record(delta)
             if self._is_blocking(delta):
@@ -870,6 +908,7 @@ class SecurityPipeline:
         source: "AsyncIterator[str]",
         holdback_chars: int = DEFAULT_HOLDBACK_CHARS,
         principal: str | None = None,
+        min_chunk_chars: int = DEFAULT_MIN_CHUNK_CHARS,
     ) -> "GuardedStream":
         """Wrap a token stream so it is scanned while it is still arriving.
 
@@ -884,7 +923,10 @@ class SecurityPipeline:
         offending text above it on screen. Replacing the message is the
         caller's job and there is no way for this to do it for them.
         """
-        return GuardedStream(self, source, holdback_chars=holdback_chars, principal=principal)
+        return GuardedStream(
+            self, source, holdback_chars=holdback_chars, principal=principal,
+            min_chunk_chars=min_chunk_chars,
+        )
 
     async def _scan_tool_result(
         self, action: str, output: object, session_id: str | None, principal: str | None,

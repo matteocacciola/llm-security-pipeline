@@ -247,9 +247,14 @@ clears every pattern shipped with the library.
 [The CPU cost is per chunk, not per character: every `feed` rescans the
 window (detection tail plus buffer), so a stream fed one token at a time
 costs roughly window-size times more than a buffered scan of the same
-text. Batch tokens into chunks of a few dozen characters before feeding;
-the hold-back already delays emission by more than that, so nothing is
-lost.
+text. `guard_stream` therefore coalesces chunks up to `min_chunk_chars`
+(48) before feeding; the hold-back already delays emission by more than
+that, so the user sees nothing different. There is a second benefit: a
+token-sized feed gives the detector less context than the hold-back can
+cover, and a long credential can leak its prefix; batched, the same stream
+blocks with nothing emitted. Off in shadow mode, where timing must be
+exactly the model's. Using `StreamingOutputGuard` directly, batch before
+feeding.
 
 [Shadow mode](detection-and-tuning.md#shadow-mode) changes neither content nor timing: the hold-back is switched
 off, chunks are forwarded exactly as they arrive, and `would_block` records

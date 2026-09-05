@@ -184,7 +184,11 @@ async def test_a_stream_leak_is_counted_because_it_should_be_zero():
             yield text[i : i + size]
 
     sink = InMemoryMetricsSink()
-    guarded = pipeline(sink).guard_stream(source(f"the token is {API_KEY} x"), holdback_chars=8)
+    # Coalescing off: batched, this stream blocks cleanly with nothing
+    # emitted (see test_streaming_guard), and there is no leak to count.
+    guarded = pipeline(sink).guard_stream(
+        source(f"the token is {API_KEY} x"), holdback_chars=8, min_chunk_chars=0,
+    )
     [c async for c in guarded]
 
     assert sink.count("stream_leaks_total") == 1
