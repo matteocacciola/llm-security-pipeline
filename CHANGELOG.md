@@ -304,6 +304,46 @@ distribution."
   their documented error; streaming equals buffered for any text and any
   chunking.
 
+### Added — mutation check of the security decisions
+
+- `tools/mutate.py` / `make mutate`: 25 targeted mutations (expiry,
+  scope, replay, signature, audience, revocation, attenuation, budgets,
+  size caps, hold-back, fail-closed, detectors, tool results, canary,
+  cross-tenant, exfil, provenance, sliding window, identifier guards,
+  audit schema). All killed. One survived on the first run — the
+  forbidden-label guard for custom (uncatalogued) metrics — and now has
+  a test.
+
+### Fixed — from a review pass over the files this session never touched
+
+- **A malformed URL in model output crashed `post_process`.** `urlsplit`
+  raises on an unclosed IPv6 bracket; the exfil guard now reports
+  `malformed_url` (a hard finding: an unparseable URL is not one to
+  forward) instead of propagating a `ValueError`.
+- **`ExfilPolicy.host_allowed` was case-sensitive** when the policy was
+  built directly rather than through `ExfilGuard(allowed_hosts=...)`.
+- **No cap on media payload size.** `MediaScanner(max_payload_bytes=)`
+  (32 MB default) refuses oversized payloads before any extractor runs,
+  `MediaScanResult.oversized`, audited. Same principle as the text caps.
+- **Duplicate pattern names in one category were silently dropped** by
+  `config_loader`; refused at load.
+
+### Fixed — from a review pass over block C
+
+- **Redis revocation lost precision.** The first Lua version rendered the
+  instant with `tostring()` — 14 significant digits, ~1e-4 s at current
+  timestamps — so a token issued microseconds before the revocation
+  landed past the rounded instant and was accepted. The script now
+  stores the string it received and compares numerically; a test on
+  every backend asserts the instant survives the round trip exactly.
+- **Redis revocation raced.** GET-then-SET let an earlier instant land
+  last; now one script, so "never moves backwards" holds under
+  concurrency (tested with 40 shuffled concurrent revocations on every
+  backend).
+- **Redis review-queue index self-heals**: a ghost entry (document
+  re-recorded under another decision, or deleted) is removed when found
+  rather than filtered forever.
+
 ### Added — after block C
 
 - **Redis Cluster verified.** A 3-master cluster was stood up and every

@@ -1752,6 +1752,7 @@ class SecurityPipeline:
             "media_type": media_type,
             "extractors": [e.extractor for e in result.extractions],
             "extractor_errors": result.extractor_errors,
+            "oversized": result.oversized,
             "risk_score": result.risk_score,
             "combined_risk_score": result.combined_risk_score,
             "detectors": ensemble.as_audit() if ensemble is not None else None,

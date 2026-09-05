@@ -127,6 +127,19 @@ class _PatternConfigFile(BaseModel):
     pii_patterns: list[_PatternEntry] = Field(default_factory=list)
     injection_patterns: list[_InjectionPatternEntry] = Field(default_factory=list)
 
+    @field_validator("secret_patterns", "pii_patterns", "injection_patterns")
+    @classmethod
+    def _names_are_unique(cls, entries: list) -> list:
+        # Patterns are keyed by name once loaded, so a duplicate would
+        # silently replace the one before it: a rule someone wrote and
+        # believes is active, and is not. Refused at load instead.
+        seen: set[str] = set()
+        for entry in entries:
+            if entry.name in seen:
+                raise ValueError(f"duplicate pattern name {entry.name!r} in the same category")
+            seen.add(entry.name)
+        return entries
+
 
 def load_pattern_file(path: str | Path) -> dict[str, dict]:
     """Load, validate and compile a single pattern config file. Raises

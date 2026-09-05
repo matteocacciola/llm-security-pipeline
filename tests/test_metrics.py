@@ -411,3 +411,21 @@ async def test_prometheus_end_to_end():
     dump = _dump(registry)
     assert 'llm_security_blocks_total{reason="risk_score",stage="input"} 1.0' in dump
     assert "u1" not in dump
+
+
+@pytest.mark.parametrize("label", ["session_id", "principal", "email", "token"])
+def test_identifying_labels_are_refused_even_on_metrics_outside_the_catalogue(label):
+    """The catalogue drops undeclared labels, which masks the forbidden-
+    label guard for every metric it knows. A custom metric has no
+    catalogue entry, so here the guard is the only thing standing between
+    an identifier and the metrics backend. Found by mutation testing: the
+    guard on this path could be deleted without a single test noticing."""
+    sink = InMemoryMetricsSink()
+
+    SafeMetricsSink(sink).increment("my_custom_total", stage="x", **{label: "leak-123"})
+    SafeMetricsSink(sink).observe("my_custom_seconds", 0.5, **{label: "leak-456"})
+
+    for (metric, labels) in list(sink.counters) + list(sink.observations):
+        assert label not in dict(labels), f"{metric} carried {label}"
+        assert "leak-" not in " ".join(dict(labels).values())
+    assert sink.count("my_custom_total", stage="x") == 1

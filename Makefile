@@ -29,6 +29,10 @@ audit: ## Check every installed dependency against the OSV/PyPI advisory databas
 	@uv sync --group dev --all-extras; \
 	uv run pip-audit --progress-spinner off
 
+mutate: ## Break each security decision in turn and check a test notices (slow; not a CI gate).
+	@uv sync --group dev --all-extras; \
+	uv run python tools/mutate.py
+
 format: ## Apply ruff's automatic fixes.
 	@uv sync --group dev --all-extras; \
 	uv run ruff check . --fix

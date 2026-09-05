@@ -607,3 +607,62 @@ async def test_replay_protection_still_holds_within_the_ttl():
     await guard.authorize(token, "read")
     with pytest.raises(ScopeError, match="maximum"):
         await guard.authorize(token, "read")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("make_backend", BACKENDS)
+async def test_concurrent_revocations_keep_the_latest_instant(make_backend):
+    """Many revocations of one subject, fired together with shuffled
+    instants: the surviving instant must be the maximum, whatever order
+    they land in. A read-then-write implementation fails this."""
+    import random
+
+    backend = await make_backend()
+    try:
+        subject = f"race-{secrets.token_hex(4)}"
+        instants = [1_000_000.0 + i for i in range(40)]
+        random.shuffle(instants)
+        await asyncio.gather(*(backend.nonce_store.revoke_subject(subject, t, 60) for t in instants))
+        assert await backend.nonce_store.revoked_at(subject) == max(instants)
+    finally:
+        await backend.aclose()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("make_backend", BACKENDS)
+async def test_a_re_recorded_document_leaves_no_ghost_in_the_old_queue(make_backend):
+    from llm_security_pipeline.sessions.stores import ProvenanceRecord
+
+    backend = await make_backend()
+    doc = f"ghost-{secrets.token_hex(4)}"
+    try:
+        store = backend.provenance_store
+        await store.record(ProvenanceRecord(doc, "h", "src", "untrusted", "quarantine", 0.5, recorded_at=1.0))
+        await store.record(ProvenanceRecord(doc, "h", "src", "untrusted", "accept", 0.1, recorded_at=2.0))
+        quarantined = [r.document_id for r in await store.list_by_decision("quarantine", 1000)]
+        accepted = [r.document_id for r in await store.list_by_decision("accept", 1000)]
+        assert doc not in quarantined
+        assert doc in accepted
+        await store.delete(doc)
+        assert doc not in [r.document_id for r in await store.list_by_decision("accept", 1000)]
+    finally:
+        await store.delete(doc)
+        await backend.aclose()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("make_backend", BACKENDS)
+async def test_the_revocation_instant_is_stored_at_full_precision(make_backend):
+    """A token issued microseconds before the revocation must be refused.
+    Redis's Lua renders numbers with 14 significant digits, ~1e-4 s at
+    today's timestamps; the instant must survive the round trip exactly."""
+    import time
+
+    backend = await make_backend()
+    try:
+        subject = f"precise-{secrets.token_hex(4)}"
+        sent = time.time() + 0.000_037
+        await backend.nonce_store.revoke_subject(subject, sent, 60)
+        assert await backend.nonce_store.revoked_at(subject) == sent
+    finally:
+        await backend.aclose()

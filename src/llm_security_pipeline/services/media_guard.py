@@ -81,6 +81,11 @@ class MediaScanResult:
     # detectors import; the pipeline owns both.
     detectors: object | None = None
     combined_risk_score: float = 0.0
+    # True when the payload exceeded max_payload_bytes and no extractor
+    # was run. Blocked, for the reason the text scanners refuse oversized
+    # input: "too big to look at" and "looked at, clean" must not produce
+    # the same verdict.
+    oversized: bool = False
 
     @property
     def matched_patterns(self) -> list[str]:
@@ -96,6 +101,14 @@ class MediaScanResult:
 # ---------------------------------------------------------------------------
 
 _PRINTABLE_RUN = re.compile(rb"[\x20-\x7e]{8,}")
+
+
+# Every extractor walks the whole payload, and a payload is whatever the
+# user uploaded. The cap bounds that work; a payload over it is refused
+# rather than scanned in part, for the same reason the text scanners
+# refuse: a partial scan reported as clean is a bypass with an address.
+# Generous, because documents and images are large; pass None to lift it.
+DEFAULT_MAX_PAYLOAD_BYTES = 32 * 1024 * 1024
 
 
 class BinaryStringsExtractor:
@@ -254,7 +267,11 @@ class MediaScanner:
         sanitizer: Sanitizer | None = None,
         threshold: float = 0.6,
         executor=None,
+        max_payload_bytes: int | None = DEFAULT_MAX_PAYLOAD_BYTES,
     ):
+        if max_payload_bytes is not None and max_payload_bytes <= 0:
+            raise ValueError("max_payload_bytes must be positive, or None for no limit.")
+        self.max_payload_bytes = max_payload_bytes
         self.extractors = list(extractors or [BinaryStringsExtractor()])
         self.sanitizer = sanitizer or Sanitizer()
         self.threshold = threshold
@@ -270,6 +287,11 @@ class MediaScanner:
         import inspect
 
         result = MediaScanResult(source_id=source_id, media_type=media_type)
+        if self.max_payload_bytes is not None and len(payload) > self.max_payload_bytes:
+            result.oversized = True
+            result.risk_score = result.combined_risk_score = 1.0
+            result.blocked = True
+            return result
 
         loop = asyncio.get_running_loop()
 

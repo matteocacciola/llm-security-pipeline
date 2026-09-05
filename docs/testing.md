@@ -137,6 +137,15 @@ a scanner that became pathologically slow at every size. Run it alone with
 The example service under `examples/` has its own tests, run in CI: an
 example that no longer runs teaches the wrong integration.
 
+`make mutate` (`tools/mutate.py`) breaks one security decision at a time —
+the expiry check, the hold-back, the fail-closed policy, twenty-five in
+all — and reports whether any test noticed. A green suite proves nothing
+about what it would catch; a surviving mutant is a decision no test
+protects. It is slow (the suite runs once per mutation) and deliberately
+not a CI gate; run it when you touch a guard. The first run found one:
+the forbidden-label guard on custom metrics could be deleted without a
+test failing, because the catalogue masked it for every known metric.
+
 Supply chain: every GitHub Action is pinned to a commit SHA (the tag is a
 comment beside it, and Dependabot keeps both current), releases use PyPI
 trusted publishing with no stored token and refuse a tag that does not

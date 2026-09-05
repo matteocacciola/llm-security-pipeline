@@ -84,6 +84,26 @@ return {tostring(updated), redis.call('EXISTS', flag_key)}
 # drops what has aged out of the window, ZADD records this event under a
 # member unique even at identical timestamps, ZCARD is the answer. Atomic
 # because it is one script, so two processes cannot both read N.
+# Revocation must never move backwards, and two revocations of the same
+# subject can race: a GET-then-SET lets the earlier instant land last and
+# un-revoke tokens issued between the two. One script, one decision.
+# The instant is kept as the STRING it arrived as. Lua's tostring() renders
+# numbers with 14 significant digits, which at 1.7e9 seconds is a
+# resolution of ~1e-4 s — coarse enough that a token issued a few
+# microseconds before the revocation lands past the rounded instant and
+# is accepted. Numbers are compared; strings are stored.
+_REVOKE_SCRIPT = """
+local key = KEYS[1]
+local at_str = ARGV[1]
+local ttl = tonumber(ARGV[2])
+local current = redis.call('GET', key)
+if current and tonumber(current) > tonumber(at_str) then
+    at_str = current
+end
+redis.call('SET', key, at_str, 'EX', ttl)
+return at_str
+"""
+
 _SLIDING_WINDOW_SCRIPT = """
 local key = KEYS[1]
 local now = tonumber(ARGV[1])
@@ -127,16 +147,15 @@ class RedisNonceStore(NonceStore):
         self._redis = redis_client
         self._key_prefix = key_prefix
         self._script = self._redis.register_script(_INCR_WITH_TTL_SCRIPT)
+        self._revoke_script = self._redis.register_script(_REVOKE_SCRIPT)
 
     def _revocation_key(self, subject: str) -> str:
         return f"{self._key_prefix}revoked:{subject}"
 
     async def revoke_subject(self, subject: str, revoked_at: float, ttl_seconds: int) -> None:
-        key = self._revocation_key(subject)
-        previous = await self._redis.get(key)
-        if previous is not None:
-            revoked_at = max(revoked_at, float(previous))
-        await self._redis.set(key, repr(revoked_at), ex=ttl_seconds)
+        await self._revoke_script(
+            keys=[self._revocation_key(subject)], args=[repr(revoked_at), ttl_seconds],
+        )
 
     async def revoked_at(self, subject: str) -> float | None:
         value = await self._redis.get(self._revocation_key(subject))
@@ -271,11 +290,16 @@ class RedisProvenanceStore(ProvenanceStore):
             # union also covers the WITHSCORES shape, hence the narrowing.
             if not isinstance(raw_id, (str, bytes)):
                 continue
-            record = await self.get(_text(raw_id))
-            # The index is written after the hash and can lag a delete by
-            # one command; never report a ghost or a stale decision.
+            doc_id = _text(raw_id)
+            record = await self.get(doc_id)
             if record is not None and record.decision == decision:
                 records.append(record)
+            else:
+                # A ghost: the hash is gone, or was re-recorded under
+                # another decision while its old index entry was still
+                # being written. Never reported, and now removed rather
+                # than left to accumulate.
+                await self._redis.zrem(self._index_key(decision), doc_id)
         return records
 
     async def set_decision(self, document_id: str, decision: str) -> bool:

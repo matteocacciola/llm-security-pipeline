@@ -116,7 +116,10 @@ un-revoking anything. The check runs before the nonce is spent, so a
 refused token does not consume a use. The revocation record lives
 `ttl_seconds` (default a day) and **must outlive the longest token TTL you
 issue**. Revoking is fail-closed on the write: a caller told "revoked" must
-not find the tokens still working. Audited as `subject_revoked`.
+not find the tokens still working. Audited as `subject_revoked`. Only
+tokens that carry a subject can be revoked this way — a token issued
+without one names nobody to revoke, which is one more reason to set
+`require_subject=True` in production.
 
 ## Delegating with an attenuated token
 

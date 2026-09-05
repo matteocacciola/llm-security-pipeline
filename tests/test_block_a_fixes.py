@@ -417,3 +417,51 @@ async def test_reset_clears_every_structure():
 
     assert store.tracked_sessions == 0
     assert not store._windows
+
+
+# ---------------------------------------------------------------------------
+# Review pass: media payload size cap
+# ---------------------------------------------------------------------------
+
+
+async def test_an_oversized_payload_is_refused_without_running_extractors():
+    from llm_security_pipeline import MediaScanner
+
+    calls = 0
+
+    class Counting:
+        name = "counting"
+
+        def extract(self, payload, media_type):
+            nonlocal calls
+            calls += 1
+            return []
+
+    scanner = MediaScanner(extractors=[Counting()], max_payload_bytes=1_000)
+    result = await scanner.scan(b"x" * 1_001)
+
+    assert result.oversized is True and result.blocked is True and result.risk_score == 1.0
+    assert calls == 0
+
+
+async def test_a_payload_under_the_cap_is_scanned():
+    from llm_security_pipeline import MediaScanner
+
+    result = await MediaScanner(max_payload_bytes=1_000).scan(b"%PDF-1.4\n hello there world\n")
+    assert result.oversized is False
+
+
+def test_media_payload_cap_must_be_positive():
+    from llm_security_pipeline import MediaScanner
+
+    with pytest.raises(ValueError):
+        MediaScanner(max_payload_bytes=0)
+
+
+async def test_a_malformed_url_in_the_output_is_a_finding_not_a_crash():
+    """urlsplit raises on an unclosed IPv6 bracket; that used to take the
+    whole response scan down with it."""
+    pipeline = SecurityPipeline(session_identity="untrusted")
+    result = await pipeline.post_process("see ![x](http://[::1) now")
+    assert result.blocked is True
+    assert "malformed_url" in result.exfil.reasons

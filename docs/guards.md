@@ -78,6 +78,10 @@ put the result through `wrap_as_data` when you build the prompt.
 
 ## Non-text input (`MediaScanner`)
 
+Payloads over `max_payload_bytes` (32 MB) are refused before any extractor
+runs and reported `oversized`, for the reason the text scanners refuse
+oversized input: a partial scan reported clean is a bypass with an address.
+
 No OCR engine is bundled, and that is a considered choice rather than a
 gap left for later. Tesseract would add tens of megabytes and a per-image
 CPU cost, and would still miss the low-contrast, rotated and stylised text
@@ -151,7 +155,8 @@ principals — and give `post_process` and `guard_stream` the `principal`.
 Anything returned is matched as a secret category
 (`cross_tenant_identifier`), so it blocks and redacts through the same path
 a credential does, buffered or streamed. The resolver may be sync or
-async. Literals shorter than four characters are dropped: an identifier
+async, and is called once per response — if it queries a database,
+cache inside it. Literals shorter than four characters are dropped: an identifier
 that short is a substring of ordinary words, not something a guard can
 police.
 

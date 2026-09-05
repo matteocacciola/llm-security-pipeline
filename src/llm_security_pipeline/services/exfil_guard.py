@@ -143,8 +143,13 @@ class ExfilPolicy:
         if host is None:
             return self.allow_relative
         host = host.lower()
-        # A bare domain in the allowlist also covers its subdomains.
-        return any(host == allowed or host.endswith(f".{allowed}") for allowed in self.allowed_hosts)
+        # A bare domain in the allowlist also covers its subdomains. The
+        # allowlist is lowercased here too, so a policy built directly
+        # (not via ExfilGuard(allowed_hosts=...)) is not case-sensitive.
+        return any(
+            host == allowed.lower() or host.endswith(f".{allowed.lower()}")
+            for allowed in self.allowed_hosts
+        )
 
 
 def shannon_entropy(value: str) -> float:
@@ -233,9 +238,16 @@ class ExfilGuard:
 
     def _classify(self, url: str, auto_fetch: bool) -> tuple[str, tuple[str, ...], str | None]:
         reasons: list[str] = []
-        parts = urlsplit(url)
-        scheme = parts.scheme.lower()
-        host = parts.hostname
+        try:
+            parts = urlsplit(url)
+            scheme = parts.scheme.lower()
+            host = parts.hostname
+        except ValueError:
+            # urlsplit raises on things like an unclosed IPv6 bracket. A
+            # URL the parser cannot read is not one to forward, and it
+            # must not be one that takes the whole response scan down
+            # with it: treat it as the hardest kind of finding.
+            return ("block" if auto_fetch else "neutralize"), ("malformed_url",), None
 
         if scheme in self.policy.denied_schemes:
             reasons.append(f"denied_scheme:{scheme}")
@@ -277,7 +289,7 @@ class ExfilGuard:
 
         hard = {
             "data_uri", "credentials_in_url", "off_allowlist",
-            "encoded_payload", "high_entropy_segment", "long_query",
+            "encoded_payload", "high_entropy_segment", "long_query", "malformed_url",
         }
         hard_hit = any(r in hard or r.startswith("denied_scheme") for r in reasons)
         severity = "neutralize"

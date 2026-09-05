@@ -158,3 +158,23 @@ def test_zero_patterns_raises(tmp_path):
 
     with pytest.raises(PatternConfigError, match="zero patterns"):
         PatternRegistry.load(custom_config_path=custom_path, include_defaults=False)
+
+def test_duplicate_pattern_names_in_one_category_are_refused(tmp_path):
+    """Keyed by name after loading, a duplicate would silently replace the
+    one before it: a rule someone believes is active, and is not."""
+    import json
+
+    from llm_security_pipeline import OutputGuard
+    from llm_security_pipeline.config_loader import PatternConfigError
+
+    config = tmp_path / "p.json"
+    config.write_text(json.dumps({
+        "secret_patterns": [
+            {"name": "k", "pattern": "a+", "flags": []},
+            {"name": "k", "pattern": "b+", "flags": []},
+        ],
+        "pii_patterns": [],
+        "injection_patterns": [],
+    }))
+    with pytest.raises(PatternConfigError, match="duplicate pattern name 'k'"):
+        OutputGuard(pattern_config_path=str(config), include_default_patterns=False)
